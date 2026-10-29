@@ -1,0 +1,6 @@
+{
+  "name": "سامانه تست نشت شبکه و امنیت VPN | LeakGuard",
+  "description": "ابزار جامع و بومی‌سازی شده سنجش نشت IP، DNS، WebRTC، تحلیل امنیت VPN و عیب‌یابی شبکه به زبان فارسی.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
