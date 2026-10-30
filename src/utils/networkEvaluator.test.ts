@@ -4,11 +4,15 @@ import {
   isValidIpv4,
   isValidIpv6,
   isPrivateOrLocalAddress,
+  isGloballyRoutablePublicIp,
+  formatTestStatusLabelFa,
   parseIceCandidateLine,
   evaluateWebRtcCandidates,
   evaluateDnsTestResult,
+  evaluateIndependentBrowserDnsObservation,
   evaluateVpnHeuristic,
   calculateHttpPingMetrics,
+  evaluatePortLeakResult,
   evaluateOverallSummary
 } from './networkEvaluator';
 
@@ -344,3 +348,178 @@ test('evaluateOverallSummary refuses to compute a numeric score when evidence is
   assert.equal(completeSummary.privacyScore, 100);
   assert.equal(completeSummary.overallStatus, 'PASS');
 });
+
+test('evaluateIndependentBrowserDnsObservation stays strictly separate from Authoritative DNS status', () => {
+  const now = new Date().toISOString();
+  const mockIpDetails: any = {
+    status: 'PASS',
+    ip: '198.51.100.10',
+    countryCode: 'DE',
+    countryName: 'Germany',
+  };
+
+  const emptyObs = evaluateIndependentBrowserDnsObservation([], mockIpDetails);
+  assert.equal(emptyObs.status, 'INCONCLUSIVE');
+
+  const validBrowserObs = evaluateIndependentBrowserDnsObservation(
+    [
+      {
+        sourceName: 'ip-api EDNS Recursive Resolver',
+        observedIp: '172.64.36.1',
+        locationOrGeo: 'Germany - Cloudflare',
+        role: 'edns_recursive_resolver',
+        responseTimeMs: 42,
+      },
+    ],
+    mockIpDetails
+  );
+  assert.equal(validBrowserObs.status, 'PASS');
+
+  // Even when independent browser observation succeeds, Authoritative DNS without env vars MUST remain NOT_CONFIGURED
+  const dnsResult = evaluateDnsTestResult({
+    runId: 'token-abc',
+    authoritativeConfigured: false,
+    missingEnvVars: ['DNS_LEAK_DOMAIN', 'DNS_COLLECTOR_API_URL', 'DNS_COLLECTOR_API_TOKEN'],
+    resolvers: [],
+    ipDetails: mockIpDetails,
+    independentBrowserObservation: validBrowserObs,
+    startedAt: now,
+    completedAt: now,
+  });
+  assert.equal(dnsResult.status, 'NOT_CONFIGURED');
+  assert.equal(dnsResult.isLeaking, null);
+  assert.equal(dnsResult.independentBrowserObservation?.status, 'PASS');
+  assert.deepEqual(dnsResult.missingEnvVars, [
+    'DNS_LEAK_DOMAIN',
+    'DNS_COLLECTOR_API_URL',
+    'DNS_COLLECTOR_API_TOKEN',
+  ]);
+});
+
+test('evaluatePortLeakResult accurately classifies local unverifiable sockets, open ports, and closed ports', () => {
+  const now = new Date().toISOString();
+
+  // 1. Local socket -> INCONCLUSIVE (never fake PASS)
+  const localRes = evaluatePortLeakResult({
+    targetIp: '127.0.0.1',
+    targetSource: 'unverifiable_local_socket',
+    canScanFromServer: false,
+    ports: [],
+    startedAt: now,
+    completedAt: now,
+  });
+  assert.equal(localRes.status, 'INCONCLUSIVE');
+  assert.equal(localRes.isExposingSensitivePorts, null);
+
+  // 2. Public IP with open router port 8291 -> LEAK_DETECTED
+  const openPortRes = evaluatePortLeakResult({
+    targetIp: '203.0.113.55',
+    targetSource: 'server_socket',
+    canScanFromServer: true,
+    ports: [
+      {
+        port: 8291,
+        protocol: 'TCP',
+        serviceName: 'MikroTik Winbox',
+        category: 'router_admin',
+        descriptionFa: 'Winbox',
+        descriptionEn: 'Winbox',
+        state: 'open',
+        responseTimeMs: 18,
+        riskLevel: 'critical',
+      },
+      {
+        port: 80,
+        protocol: 'TCP',
+        serviceName: 'HTTP Router Admin',
+        category: 'router_admin',
+        descriptionFa: 'HTTP',
+        descriptionEn: 'HTTP',
+        state: 'closed',
+        responseTimeMs: 15,
+        riskLevel: 'critical',
+      },
+    ],
+    startedAt: now,
+    completedAt: now,
+  });
+  assert.equal(openPortRes.status, 'LEAK_DETECTED');
+  assert.equal(openPortRes.isExposingSensitivePorts, true);
+  assert.deepEqual(openPortRes.openPorts, [8291]);
+
+  // 3. Public IP with all ports closed/filtered -> PASS
+  const closedPortRes = evaluatePortLeakResult({
+    targetIp: '203.0.113.55',
+    targetSource: 'server_socket',
+    canScanFromServer: true,
+    ports: [
+      {
+        port: 80,
+        protocol: 'TCP',
+        serviceName: 'HTTP Router Admin',
+        category: 'router_admin',
+        descriptionFa: 'HTTP',
+        descriptionEn: 'HTTP',
+        state: 'closed',
+        responseTimeMs: 14,
+        riskLevel: 'critical',
+      },
+    ],
+    startedAt: now,
+    completedAt: now,
+  });
+  assert.equal(closedPortRes.status, 'PASS');
+  assert.equal(closedPortRes.isExposingSensitivePorts, false);
+});
+
+test('isGloballyRoutablePublicIp blocks all loopback, RFC1918, CGNAT, metadata, IPv4-mapped IPv6, and TEST-NET ranges against SSRF', () => {
+  // Blocked IPv4 ranges
+  assert.equal(isGloballyRoutablePublicIp('127.0.0.1'), false);
+  assert.equal(isGloballyRoutablePublicIp('127.0.0.2'), false);
+  assert.equal(isGloballyRoutablePublicIp('127.255.255.254'), false);
+  assert.equal(isGloballyRoutablePublicIp('0.0.0.0'), false);
+  assert.equal(isGloballyRoutablePublicIp('10.0.0.1'), false);
+  assert.equal(isGloballyRoutablePublicIp('100.64.0.1'), false);
+  assert.equal(isGloballyRoutablePublicIp('169.254.169.254'), false);
+  assert.equal(isGloballyRoutablePublicIp('172.16.0.1'), false);
+  assert.equal(isGloballyRoutablePublicIp('172.31.255.255'), false);
+  assert.equal(isGloballyRoutablePublicIp('192.168.1.1'), false);
+  assert.equal(isGloballyRoutablePublicIp('192.0.2.1'), false);
+  assert.equal(isGloballyRoutablePublicIp('198.51.100.1'), false);
+  assert.equal(isGloballyRoutablePublicIp('203.0.113.1'), false);
+  assert.equal(isGloballyRoutablePublicIp('224.0.0.1'), false);
+  assert.equal(isGloballyRoutablePublicIp('255.255.255.255'), false);
+
+  // Blocked IPv6 and IPv4-mapped IPv6 ranges
+  assert.equal(isGloballyRoutablePublicIp('::1'), false);
+  assert.equal(isGloballyRoutablePublicIp('::'), false);
+  assert.equal(isGloballyRoutablePublicIp('::ffff:127.0.0.1'), false);
+  assert.equal(isGloballyRoutablePublicIp('::ffff:169.254.169.254'), false);
+  assert.equal(isGloballyRoutablePublicIp('::ffff:10.0.0.1'), false);
+  assert.equal(isGloballyRoutablePublicIp('fe80::1'), false);
+  assert.equal(isGloballyRoutablePublicIp('fc00::1'), false);
+  assert.equal(isGloballyRoutablePublicIp('fd12:3456:789a::1'), false);
+  assert.equal(isGloballyRoutablePublicIp('ff02::1'), false);
+  assert.equal(isGloballyRoutablePublicIp('2001:db8::1'), false);
+  assert.equal(isGloballyRoutablePublicIp('localhost'), false);
+  assert.equal(isGloballyRoutablePublicIp(''), false);
+
+  // Allowed globally routable public IPs
+  assert.equal(isGloballyRoutablePublicIp('8.8.8.8'), true);
+  assert.equal(isGloballyRoutablePublicIp('1.1.1.1'), true);
+  assert.equal(isGloballyRoutablePublicIp('172.32.0.1'), true);
+  assert.equal(isGloballyRoutablePublicIp('2606:4700:4700::1111'), true);
+  assert.equal(isGloballyRoutablePublicIp('::ffff:8.8.8.8'), true);
+});
+
+test('formatTestStatusLabelFa translates all status enums into distinct Persian labels', () => {
+  assert.equal(formatTestStatusLabelFa('PASS'), 'موفق');
+  assert.equal(formatTestStatusLabelFa('LEAK_DETECTED'), 'نشت شناسایی شد');
+  assert.equal(formatTestStatusLabelFa('INCONCLUSIVE'), 'نامشخص');
+  assert.equal(formatTestStatusLabelFa('NOT_CONFIGURED'), 'پیکربندی نشده');
+  assert.equal(formatTestStatusLabelFa('UNSUPPORTED'), 'پشتیبانی نشده');
+  assert.equal(formatTestStatusLabelFa('ERROR'), 'خطا در آزمون');
+  assert.equal(formatTestStatusLabelFa(null), 'نامشخص');
+});
+
+

@@ -15,11 +15,12 @@ export const translations = {
     languageName: 'فارسی',
 
     // Status Badges
-    statusPass: 'آزمایش موفق (امن)',
-    statusWarning: 'هشدار امنیتی',
+    statusPass: 'موفق',
+    statusWarning: 'هشدار',
     statusLeakDetected: 'نشت شناسایی شد',
-    statusInconclusive: 'نتیجه نامشخص',
-    statusNotTested: 'آزمایش انجام نشد',
+    statusInconclusive: 'نامشخص',
+    statusNotConfigured: 'پیکربندی نشده',
+    statusNotTested: 'اجرا نشده',
     statusTesting: 'در حال آزمایش...',
 
     // Hero Score Section
@@ -38,6 +39,7 @@ export const translations = {
     dnsLeakTitle: 'آزمایش نشت DNS (Domain Name System)',
     webRtcTitle: 'آزمایش نشت WebRTC مرورگر',
     vpnAnalysisTitle: 'سنجش اعتبار و امنیت تونل VPN / پروکسی',
+    portLeakTitle: 'بررسی پورت‌های باز و مدیریت روتر (Port Exposure)',
     speedDiagnosticsTitle: 'تست سرعت، پینگ و پایداری شبکه',
     aiAuditTitle: 'تحلیل هوشمند امنیت توسط هوش مصنوعی',
     globeVisualizerTitle: 'نمایشگر سه بعدی کره زمین و مسیر ارتباطی شبکه',
@@ -147,6 +149,7 @@ export const translations = {
     dnsLeakTitle: 'DNS Leak Test',
     webRtcTitle: 'WebRTC Leak Test',
     vpnAnalysisTitle: 'VPN & Proxy Integrity Analysis',
+    portLeakTitle: 'Open Ports & Router Admin Exposure',
     speedDiagnosticsTitle: 'Speed, Ping & Network Diagnostics',
     aiAuditTitle: 'AI-Powered Security Audit',
     globeVisualizerTitle: '3D Interactive Globe & Network Routing',

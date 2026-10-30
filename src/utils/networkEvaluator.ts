@@ -2,8 +2,12 @@ import {
   ConfidenceLevel,
   DnsLeakResult,
   DnsResolver,
+  IndependentBrowserDnsEntry,
+  IndependentBrowserDnsObservation,
   IpDetails,
   NetworkMetrics,
+  PortLeakResult,
+  PortProbeEntry,
   TestStatus,
   VpnProxyResult,
   WebRtcCandidate,
@@ -33,31 +37,114 @@ export function isValidIpv6(ip: string): boolean {
 }
 
 /**
- * Determines whether an IP or hostname is RFC1918 private, loopback, link-local, unique-local IPv6, or mDNS (.local).
+ * Converts a TestStatus enum into the standardized Persian label:
+ * - PASS: موفق
+ * - LEAK_DETECTED: نشت شناسایی شد
+ * - INCONCLUSIVE: نامشخص
+ * - NOT_CONFIGURED: پیکربندی نشده
+ */
+export function formatTestStatusLabelFa(status: TestStatus | string | undefined | null): string {
+  switch (status) {
+    case 'PASS':
+      return 'موفق';
+    case 'LEAK_DETECTED':
+      return 'نشت شناسایی شد';
+    case 'WARNING':
+      return 'هشدار';
+    case 'NOT_CONFIGURED':
+      return 'پیکربندی نشده';
+    case 'INCONCLUSIVE':
+      return 'نامشخص';
+    case 'UNSUPPORTED':
+      return 'پشتیبانی نشده';
+    case 'ERROR':
+      return 'خطا در آزمون';
+    case 'TESTING':
+      return 'در حال آزمایش...';
+    default:
+      return 'نامشخص';
+  }
+}
+
+/**
+ * Determines whether an IP or hostname is RFC1918 private, loopback, link-local, CGNAT, multicast, reserved, unique-local IPv6, or mDNS (.local).
  */
 export function isPrivateOrLocalAddress(address: string): boolean {
-  const addr = address.trim().toLowerCase();
-  if (addr.endsWith('.local')) return true;
-  if (addr === '127.0.0.1' || addr === '::1' || addr === 'localhost') return true;
+  if (!address || typeof address !== 'string') return true;
+  let addr = address.trim().toLowerCase();
+  if (addr.endsWith('.local') || addr === 'localhost') return true;
+
+  // Unwrap IPv4-mapped IPv6 addresses (e.g. ::ffff:127.0.0.1 or ::ffff:10.0.0.1)
+  if (addr.startsWith('::ffff:')) {
+    addr = addr.slice(7);
+  } else if (addr.startsWith('0:0:0:0:0:ffff:')) {
+    addr = addr.slice(15);
+  }
+
+  if (addr === '127.0.0.1' || addr === '::1' || addr === '::' || addr === '0:0:0:0:0:0:0:1' || addr === '0:0:0:0:0:0:0:0') {
+    return true;
+  }
 
   if (isValidIpv4(addr)) {
     const parts = addr.split('.').map(Number);
-    if (parts[0] === 10) return true;
-    if (parts[0] === 127) return true;
-    if (parts[0] === 192 && parts[1] === 168) return true;
-    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
-    if (parts[0] === 169 && parts[1] === 254) return true;
-    if (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) return true; // CGNAT
+    if (parts[0] === 0) return true; // 0.0.0.0/8 current network
+    if (parts[0] === 10) return true; // 10.0.0.0/8 RFC1918
+    if (parts[0] === 127) return true; // 127.0.0.0/8 loopback
+    if (parts[0] === 169 && parts[1] === 254) return true; // 169.254.0.0/16 link-local / cloud metadata
+    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true; // 172.16.0.0/12 RFC1918
+    if (parts[0] === 192 && parts[1] === 168) return true; // 192.168.0.0/16 RFC1918
+    if (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) return true; // 100.64.0.0/10 CGNAT
+    if (parts[0] === 192 && parts[1] === 0 && parts[2] === 0) return true; // 192.0.0.0/24 IETF
+    if (parts[0] === 198 && (parts[1] === 18 || parts[1] === 19)) return true; // 198.18.0.0/15 benchmarking
+    if (parts[0] >= 224) return true; // 224.0.0.0/4 multicast & 240.0.0.0/4 reserved/broadcast
     return false;
   }
 
   if (addr.includes(':')) {
-    if (addr.startsWith('fe80:') || addr.startsWith('fc') || addr.startsWith('fd') || addr === '::1') {
+    if (
+      addr.startsWith('fe8') ||
+      addr.startsWith('fe9') ||
+      addr.startsWith('fea') ||
+      addr.startsWith('feb') ||
+      addr.startsWith('fc') ||
+      addr.startsWith('fd') ||
+      addr.startsWith('ff') ||
+      addr.startsWith('2001:db8:') ||
+      addr.startsWith('2001:0db8:')
+    ) {
       return true;
     }
   }
 
   return false;
+}
+
+/**
+ * Strictly checks if an input is a globally routable public IPv4 or IPv6 literal suitable for external scanning/probing.
+ * Rejects hostnames, loopback, RFC1918, CGNAT, link-local/metadata (169.254.169.254), multicast, broadcast, and documentation ranges.
+ */
+export function isGloballyRoutablePublicIp(address: string | null | undefined): boolean {
+  if (!address || typeof address !== 'string') return false;
+  let cleaned = address.trim().toLowerCase();
+  if (cleaned.startsWith('::ffff:')) {
+    cleaned = cleaned.slice(7);
+  } else if (cleaned.startsWith('0:0:0:0:0:ffff:')) {
+    cleaned = cleaned.slice(15);
+  }
+  if (!isValidIpv4(cleaned) && !isValidIpv6(cleaned)) {
+    return false;
+  }
+  if (isPrivateOrLocalAddress(cleaned)) {
+    return false;
+  }
+  if (isValidIpv4(cleaned)) {
+    const parts = cleaned.split('.').map(Number);
+    // Also exclude documentation TEST-NET ranges from active TCP port scanning
+    if (parts[0] === 192 && parts[1] === 0 && parts[2] === 2) return false; // 192.0.2.0/24 TEST-NET-1
+    if (parts[0] === 198 && parts[1] === 51 && parts[2] === 100) return false; // 198.51.100.0/24 TEST-NET-2
+    if (parts[0] === 203 && parts[1] === 0 && parts[2] === 113) return false; // 203.0.113.0/24 TEST-NET-3
+  }
+  return true;
 }
 
 /**
@@ -338,13 +425,99 @@ export function evaluateWebRtcCandidates(params: {
 }
 
 /**
+ * Evaluates independent, zero-cost browser-observable DNS & edge trace data (e.g. edns.ip-api.com, 1.1.1.1/cdn-cgi/trace).
+ * Strictly separated from Authoritative DNS Leak Test: never claims full authoritative DNS verification.
+ */
+export function evaluateIndependentBrowserDnsObservation(
+  entries: IndependentBrowserDnsEntry[],
+  ipDetails: IpDetails | null
+): IndependentBrowserDnsObservation {
+  const limitationsFa = [
+    'این بررسی مستقل از طریق درخواست‌های HTTPS مرورگر به سرویس‌های عمومی رایگان (مانند EDNS و Cloudflare Trace) انجام می‌شود و جایگزین تست Authoritative DNS Leak اختصاصی نیست.',
+    'در صورتی که مرورگر از DNS-over-HTTPS (DoH) داخلی استفاده کند، مسیر DNS مرورگر ممکن است با Resolver سطح سیستم‌عامل (OS-level DNS) متفاوت باشد.',
+    'یک استعلام تک‌نقطه‌ای از مرورگر تمام Resolverهای چرخشی (Round-Robin) یا فورواردرهای پنهان ISP را آشکار نمی‌کند.'
+  ];
+
+  if (!entries || entries.length === 0) {
+    return {
+      status: 'INCONCLUSIVE',
+      entries: [],
+      matchesPrimaryEgressIp: null,
+      summaryFa:
+        'نامشخص: پاسخ معتبری از منابع مستقل بررسی DNS/Trace مرورگر دریافت نشد (احتمال مسدودسازی CORS، فایروال یا عدم دسترسی شبکه). هیچ مقدار جعلی تولید نشد.',
+      summaryEn:
+        'Inconclusive: No response received from independent browser DNS/trace endpoints. No synthetic data generated.',
+      limitationsFa,
+    };
+  }
+
+  const ednsResolvers = entries.filter(e => e.role === 'edns_recursive_resolver' || e.role === 'client_subnet_edns');
+  const primaryCountry = ipDetails?.countryCode?.toUpperCase() || null;
+  const primaryCountryName = ipDetails?.countryName?.toLowerCase() || null;
+
+  // Check if any observed EDNS resolver geo conflicts with the primary IP country (e.g. Iran vs non-Iran)
+  const hasGeoConflict =
+    primaryCountry &&
+    ednsResolvers.some(r => {
+      const locLower = r.locationOrGeo.toLowerCase();
+      if (primaryCountry !== 'IR' && (locLower.includes('iran') || locLower === 'ir')) {
+        return true;
+      }
+      if (primaryCountryName && locLower && !locLower.includes(primaryCountryName) && ednsResolvers.length > 0) {
+        // Different country name reported by EDNS
+        return false;
+      }
+      return false;
+    });
+
+  if (hasGeoConflict) {
+    return {
+      status: 'LEAK_DETECTED',
+      entries,
+      matchesPrimaryEgressIp: false,
+      summaryFa:
+        'نشت شناسایی شد (در مشاهدهٔ مستقل مرورگر): موقعیت Resolver مشاهده‌شده در سرویس مستقل EDNS با کشور آدرس IP خروجی مغایرت دارد.',
+      summaryEn:
+        'Leak Detected (Independent Browser Observation): Observed EDNS resolver location conflicts with primary egress IP country.',
+      limitationsFa,
+    };
+  }
+
+  if (ednsResolvers.length > 0) {
+    return {
+      status: 'PASS',
+      entries,
+      matchesPrimaryEgressIp: true,
+      summaryFa: `مشاهدهٔ مستقل مرورگر انجام شد (${entries.length} منبع پاسخگو): هیچ مغایرت آشکاری در استعلام تک‌نقطه‌ای دیده نشد (اما این بررسی جایگزین تست Authoritative DNS نیست).`,
+      summaryEn: `Independent browser observation completed (${entries.length} source(s)): No obvious mismatch in single-point check (not a substitute for Authoritative DNS test).`,
+      limitationsFa,
+    };
+  }
+
+  return {
+    status: 'INCONCLUSIVE',
+    entries,
+    matchesPrimaryEgressIp: null,
+    summaryFa:
+      'نامشخص: فقط مسیر خروجی (Edge Trace) از مرورگر مشاهده شد و اطلاعاتی از Recursive Resolver توسط سرویس EDNS برگردانده نشد.',
+    summaryEn:
+      'Inconclusive: Only edge trace egress was observed; recursive DNS resolver IP was not returned by independent EDNS.',
+    limitationsFa,
+  };
+}
+
+/**
  * Evaluates DNS Leak results based on real authoritative logs or explicitly marks NOT_CONFIGURED / INCONCLUSIVE.
+ * Browser-side DNS observations are stored separately in `independentBrowserObservation` and NEVER turn an unconfigured
+ * Authoritative DNS Leak Test into PASS or LEAK_DETECTED.
  */
 export function evaluateDnsTestResult(params: {
   runId: string;
   authoritativeConfigured: boolean;
+  missingEnvVars?: string[];
   resolvers: DnsResolver[];
   ipDetails: IpDetails | null;
+  independentBrowserObservation?: IndependentBrowserDnsObservation;
   startedAt: string;
   completedAt: string;
   errorMessage?: string;
@@ -352,8 +525,10 @@ export function evaluateDnsTestResult(params: {
   const {
     runId,
     authoritativeConfigured,
+    missingEnvVars = ['DNS_LEAK_DOMAIN', 'DNS_COLLECTOR_API_URL', 'DNS_COLLECTOR_API_TOKEN'],
     resolvers,
     ipDetails,
+    independentBrowserObservation,
     startedAt,
     completedAt,
     errorMessage,
@@ -361,8 +536,49 @@ export function evaluateDnsTestResult(params: {
 
   const dnsLimitations = [
     'مشاهدهٔ آدرس IP در سرور Authoritative DNS فقط آخرین گره (Egress Resolver) زنجیرهٔ DNS را نشان می‌دهد و در صورت استفاده از DoH/DoT یا فورواردر واسط، کل زنجیره آشکار نمی‌شود.',
-    'تست DNS از داخل مرورگر صرفاً درخواست‌های شبکهٔ مرورگر (یا DoH فعال در مرورگر) را آزمایش می‌کند و وضعیت Resolver سطح سیستم‌عامل (OS-level DNS) سایر برنامه‌ها را اثبات نمی‌کند.'
+    'تست DNS از داخل مرورگر صرفاً درخواست‌های شبکهٔ مرورگر (یا DoH فعال در مرورگر) را آزمایش می‌کند و وضعیت Resolver سطح سیستم‌عامل (OS-level DNS) سایر برنامه‌ها را اثبات نمی‌کند.',
+    'بررسی DNS از طریق مرورگر با تست Authoritative DNS Leak یکسان نیست؛ برای اثبات قطعی عدم نشت، سرور Authoritative DNS اختصاصی الزامی است.'
   ];
+
+  if (!authoritativeConfigured) {
+    const missingList =
+      missingEnvVars.length > 0
+        ? missingEnvVars
+        : ['DNS_LEAK_DOMAIN', 'DNS_COLLECTOR_API_URL', 'DNS_COLLECTOR_API_TOKEN'];
+
+    return {
+      status: 'NOT_CONFIGURED',
+      testName: 'Authoritative DNS Leak & Resolver Probe',
+      startedAt,
+      completedAt,
+      observations: [
+        `وضعیت تست Authoritative DNS: پیکربندی نشده — متغیرهای (${missingList.join('، ')}) تنظیم نشده‌اند.`,
+        'طبق اصل صداقت فنی، بدون زیرساخت Authoritative DNS اختصاصی، نتیجهٔ این تست هرگز «موفق» یا «امن» اعلام نمی‌شود.',
+      ],
+      evidence: {
+        runId,
+        authoritativeConfigured: false,
+        missingEnvVars: missingList,
+        independentBrowserObservation: independentBrowserObservation || null,
+      },
+      limitations: [
+        ...dnsLimitations,
+        `برای فعال‌سازی تست Authoritative DNS، تنظیم متغیرهای ${missingList.join('، ')} جهت ثبت کوئری ساب‌دامین یکتای هر اجرا (\${runId}.<DNS_LEAK_DOMAIN>) ضروری است.`
+      ],
+      errorCode: 'AUTHORITATIVE_DNS_NOT_CONFIGURED',
+      source: 'Authoritative DNS Configuration Check',
+      confidence: 'none',
+      runId,
+      authoritativeConfigured: false,
+      missingEnvVars: missingList,
+      detectedResolversCount: 0,
+      resolvers: [],
+      isLeaking: null,
+      independentBrowserObservation,
+      messageFa: `پیکربندی نشده: متغیرهای (${missingList.join('، ')}) تنظیم نشده‌اند. بدون سرور Authoritative DNS اختصاصی، نمی‌توان عدم نشت DNS را تأیید یا رد کرد.`,
+      messageEn: `Not Configured: Environment variables (${missingList.join(', ')}) are not set. Cannot claim DNS safety without an authoritative DNS collector.`,
+    };
+  }
 
   if (errorMessage) {
     return {
@@ -370,7 +586,7 @@ export function evaluateDnsTestResult(params: {
       testName: 'Authoritative DNS Leak & Resolver Probe',
       startedAt,
       completedAt,
-      observations: [`خطا در اجرای آزمون DNS: ${errorMessage}`],
+      observations: [`خطا در اجرای آزمون Authoritative DNS: ${errorMessage}`],
       evidence: { runId, authoritativeConfigured, errorMessage },
       limitations: dnsLimitations,
       errorCode: 'DNS_PROBE_ERROR',
@@ -378,46 +594,13 @@ export function evaluateDnsTestResult(params: {
       confidence: 'none',
       runId,
       authoritativeConfigured,
+      missingEnvVars: [],
       detectedResolversCount: 0,
       resolvers: [],
       isLeaking: null,
+      independentBrowserObservation,
       messageFa: `خطا در اجرای تست نشت DNS: ${errorMessage}. هیچ سرور DNS ساختگی نمایش داده نمی‌شود.`,
       messageEn: `DNS Leak test failed: ${errorMessage}. No synthetic resolvers were generated.`,
-    };
-  }
-
-  if (!authoritativeConfigured) {
-    return {
-      status: 'NOT_CONFIGURED',
-      testName: 'Authoritative DNS Leak & Resolver Probe',
-      startedAt,
-      completedAt,
-      observations: [
-        `شناسه یکتای رمزنگارانه آزمون (${runId}) تولید شد، اما دامنهٔ Authoritative DNS اختصاصی (DNS_LEAK_DOMAIN) و سرویس ثبت لاگ (DNS_COLLECTOR_API_URL) در متغیرهای محیطی سرور تنظیم نشده‌اند.`,
-        ...(resolvers.length > 0
-          ? [`مشاهدهٔ کمکی از مسیر Trace/Server (${resolvers.length} مورد) ثبت شد، اما جایگزین لاگ Authoritative DNS کلاینت نیست.`]
-          : []),
-      ],
-      evidence: {
-        runId,
-        authoritativeConfigured: false,
-        auxiliaryObservationsCount: resolvers.length,
-        resolvers,
-      },
-      limitations: [
-        ...dnsLimitations,
-        'برای اثبات قطعی نشت DNS کلاینت، نیاز به دامنهٔ تحت کنترل و سرور Authoritative DNS است تا کوئریِ ساب‌دامین یکتای هر اجرا (${runId}.<DNS_LEAK_DOMAIN>) را در سمت سرور نام ثبت کند.'
-      ],
-      errorCode: 'AUTHORITATIVE_DNS_NOT_CONFIGURED',
-      source: 'Server Configuration & Auxiliary Trace',
-      confidence: 'low',
-      runId,
-      authoritativeConfigured: false,
-      detectedResolversCount: resolvers.length,
-      resolvers,
-      isLeaking: null,
-      messageFa: 'زیرساخت Authoritative DNS تنظیم نشده است (not_configured): بدون دامنهٔ اختصاصی و ثبت‌کنندهٔ کوئری Authoritative، نمی‌توان Resolver نهایی کلاینت را با قطعیت اثبات کرد.',
-      messageEn: 'Not Configured: Authoritative DNS collector domain (DNS_LEAK_DOMAIN) is required to verify client recursive resolvers.',
     };
   }
 
@@ -437,10 +620,12 @@ export function evaluateDnsTestResult(params: {
       confidence: 'low',
       runId,
       authoritativeConfigured: true,
+      missingEnvVars: [],
       detectedResolversCount: 0,
       resolvers: [],
       isLeaking: null,
-      messageFa: 'نتیجه نامشخص: هیچ کوئری DNS متناظر با شناسهٔ یکتای این اجرا در سرور Authoritative ثبت نشد.',
+      independentBrowserObservation,
+      messageFa: 'نامشخص: هیچ کوئری DNS متناظر با شناسهٔ یکتای این اجرا در سرور Authoritative ثبت نشد.',
       messageEn: 'Inconclusive: No DNS queries matching the unique run token were captured at the authoritative server.',
     };
   }
@@ -449,7 +634,6 @@ export function evaluateDnsTestResult(params: {
   const clientCountry = ipDetails?.countryCode?.toUpperCase();
   const hasDomesticOrMismatchedResolver = resolvers.some(r => {
     if (!clientCountry || !r.location) return false;
-    // If user is using a VPN (e.g. DE) but DNS resolver is in IR, or if client is direct ISP
     return r.status.includes('مغایرت') || r.status.toLowerCase().includes('leak');
   });
 
@@ -459,7 +643,7 @@ export function evaluateDnsTestResult(params: {
     startedAt,
     completedAt,
     observations: [
-      `تعداد ${resolvers.length} سرور Resolver از طریق لاگ واقعی برای شناسهٔ ${runId} مشاهده شد.`
+      `تعداد ${resolvers.length} سرور Resolver از طریق لاگ واقعی Authoritative DNS برای شناسهٔ ${runId} مشاهده شد.`
     ],
     evidence: {
       runId,
@@ -472,15 +656,17 @@ export function evaluateDnsTestResult(params: {
     confidence: 'high',
     runId,
     authoritativeConfigured: true,
+    missingEnvVars: [],
     detectedResolversCount: resolvers.length,
     resolvers,
     isLeaking: hasDomesticOrMismatchedResolver,
+    independentBrowserObservation,
     messageFa: hasDomesticOrMismatchedResolver
-      ? 'نشت DNS تأیید شد: سرورهای Resolver مشاهده‌شده در Authoritative DNS با مسیر تونل مورد انتظار مغایرت دارند.'
-      : `آزمایش Authoritative DNS کامل شد: ${resolvers.length} سرور Resolver مشاهده و ثبت گردید.`,
+      ? 'نشت شناسایی شد: سرورهای Resolver مشاهده‌شده در Authoritative DNS با مسیر تونل مورد انتظار مغایرت دارند.'
+      : `موفق: آزمایش Authoritative DNS با شواهد واقعی تکمیل شد (${resolvers.length} سرور Resolver مشاهده و ثبت گردید).`,
     messageEn: hasDomesticOrMismatchedResolver
-      ? 'Confirmed DNS Leak: Observed authoritative resolvers conflict with expected tunnel egress.'
-      : `Authoritative DNS probe completed: ${resolvers.length} resolver(s) observed.`,
+      ? 'Leak Detected: Observed authoritative resolvers conflict with expected tunnel egress.'
+      : `Pass: Authoritative DNS probe completed with ${resolvers.length} verified resolver(s).`,
   };
 }
 
@@ -752,6 +938,287 @@ export function calculateHttpPingMetrics(params: {
   };
 }
 
+export const COMMON_SENSITIVE_PORTS: Omit<PortProbeEntry, 'state' | 'responseTimeMs'>[] = [
+  {
+    port: 80,
+    protocol: 'TCP',
+    serviceName: 'HTTP Router Admin',
+    category: 'router_admin',
+    descriptionFa: 'پنل وب مدیریت مودم/روتر (HTTP غیررمزنگاری‌شده)',
+    descriptionEn: 'Unencrypted Router/Modem Web Admin Panel (HTTP)',
+    riskLevel: 'critical',
+  },
+  {
+    port: 443,
+    protocol: 'TCP',
+    serviceName: 'HTTPS Admin / TLS',
+    category: 'router_admin',
+    descriptionFa: 'پنل مدیریت وب رمزنگاری‌شده (HTTPS WAN Admin)',
+    descriptionEn: 'Encrypted Web Management / TLS Service',
+    riskLevel: 'medium',
+  },
+  {
+    port: 8080,
+    protocol: 'TCP',
+    serviceName: 'HTTP Alt / Router WAN',
+    category: 'router_admin',
+    descriptionFa: 'پورت جایگزین مدیریت از راه دور روتر یا پروکسی HTTP',
+    descriptionEn: 'Alternative Router Remote Management or HTTP Proxy',
+    riskLevel: 'critical',
+  },
+  {
+    port: 8291,
+    protocol: 'TCP',
+    serviceName: 'MikroTik Winbox',
+    category: 'router_admin',
+    descriptionFa: 'پورت اختصاصی مدیریت روترهای MikroTik (Winbox)',
+    descriptionEn: 'MikroTik RouterOS Winbox Management Port',
+    riskLevel: 'critical',
+  },
+  {
+    port: 22,
+    protocol: 'TCP',
+    serviceName: 'SSH Remote Shell',
+    category: 'remote_access',
+    descriptionFa: 'پورت خط فرمان راه دور (SSH) روی روتر یا سرور',
+    descriptionEn: 'Secure Shell (SSH) Remote Access',
+    riskLevel: 'high',
+  },
+  {
+    port: 23,
+    protocol: 'TCP',
+    serviceName: 'Telnet Legacy Admin',
+    category: 'remote_access',
+    descriptionFa: 'پورت مدیریت متنی ناامن (Telnet) با خطر افشای گذرواژه',
+    descriptionEn: 'Unencrypted Telnet Remote Console',
+    riskLevel: 'critical',
+  },
+  {
+    port: 21,
+    protocol: 'TCP',
+    serviceName: 'FTP File Server',
+    category: 'file_share',
+    descriptionFa: 'سرویس اشتراک فایل FTP روی مودم/روتر (USB Share)',
+    descriptionEn: 'FTP File Sharing Service',
+    riskLevel: 'high',
+  },
+  {
+    port: 1080,
+    protocol: 'TCP',
+    serviceName: 'SOCKS Proxy',
+    category: 'proxy_relay',
+    descriptionFa: 'پورت پیش‌فرض پروکسی SOCKS4/5 باز در سمت کلاینت',
+    descriptionEn: 'Open SOCKS Proxy Port',
+    riskLevel: 'critical',
+  },
+];
+
+/**
+ * Evaluates TCP Port Exposure results strictly from real server-side TCP socket probes.
+ * Never fabricates open/closed port states when the client IP is local/loopback or unverifiable.
+ */
+export function evaluatePortLeakResult(params: {
+  targetIp: string | null;
+  targetSource: 'server_socket' | 'trusted_proxy_header' | 'unverifiable_local_socket';
+  canScanFromServer: boolean;
+  ports: PortProbeEntry[];
+  startedAt: string;
+  completedAt: string;
+  errorMessage?: string;
+}): PortLeakResult {
+  const {
+    targetIp,
+    targetSource,
+    canScanFromServer,
+    ports,
+    startedAt,
+    completedAt,
+    errorMessage,
+  } = params;
+
+  const portLimitations = [
+    'این آزمایش صرفاً از سمت سرور برنامه به سمت آدرس IP عمومی مشاهده‌شدهٔ شما (TCP Handshake) انجام می‌شود و به دلیل امنیت (جلوگیری از SSRF) هرگز آدرس‌های دلخواه یا شبکهٔ داخلی (RFC1918 / Localhost) اسکن نمی‌شوند.',
+    'اگر پشت CGNAT اپراتور یا سرور خروجی VPN باشید، نتیجهٔ اسکن وضعیت فایروالِ IP خروجی فعلی را نشان می‌دهد و پورت‌های باز در شبکهٔ خانگی داخلی (LAN) را از بیرون اینترنت رؤیت نمی‌کند.'
+  ];
+
+  const defaultPorts: PortProbeEntry[] =
+    ports.length > 0
+      ? ports
+      : COMMON_SENSITIVE_PORTS.map(p => ({
+          ...p,
+          state: 'not_tested',
+          responseTimeMs: null,
+        }));
+
+  if (errorMessage) {
+    return {
+      status: 'ERROR',
+      testName: 'Common Router & Sensitive TCP Port Exposure Probe',
+      startedAt,
+      completedAt,
+      observations: [`خطا در اجرای تست پورت‌های باز: ${errorMessage}`],
+      evidence: { targetIp, targetSource, canScanFromServer, errorMessage },
+      limitations: portLimitations,
+      errorCode: 'PORT_SCAN_ERROR',
+      source: 'Server TCP Socket Probe (/api/port-scan)',
+      confidence: 'none',
+      targetIp,
+      targetSource,
+      canScanFromServer: false,
+      scannedPortsCount: 0,
+      openPortsCount: 0,
+      closedPortsCount: 0,
+      filteredPortsCount: 0,
+      openPorts: [],
+      isExposingSensitivePorts: null,
+      ports: defaultPorts,
+      messageFa: `خطا در بررسی پورت‌ها: ${errorMessage}. هیچ وضعیت ساختگی تولید نشد.`,
+      messageEn: `Port exposure probe failed: ${errorMessage}.`,
+    };
+  }
+
+  if (!canScanFromServer || !targetIp || isPrivateOrLocalAddress(targetIp)) {
+    return {
+      status: 'INCONCLUSIVE',
+      testName: 'Common Router & Sensitive TCP Port Exposure Probe',
+      startedAt,
+      completedAt,
+      observations: [
+        `آدرس مشاهده‌شده در سوکت سرور (${targetIp || 'نامشخص'}) یک آدرس محلی/داخلی است یا هدر پروکسی بدون TRUST_PROXY=true قابل استناد برای اسکن پورت نیست.`,
+        'به منظور جلوگیری از خطای امنیتی SSRF و عدم اسکن پورت‌های خودِ سرور، هیچ اسکن کاذبی اجرا نشد.'
+      ],
+      evidence: {
+        targetIp,
+        targetSource,
+        canScanFromServer: false,
+      },
+      limitations: portLimitations,
+      errorCode: 'UNVERIFIABLE_PUBLIC_SOCKET_IP',
+      source: 'Server TCP Socket Probe (/api/port-scan)',
+      confidence: 'none',
+      targetIp,
+      targetSource,
+      canScanFromServer: false,
+      scannedPortsCount: 0,
+      openPortsCount: 0,
+      closedPortsCount: 0,
+      filteredPortsCount: 0,
+      openPorts: [],
+      isExposingSensitivePorts: null,
+      ports: defaultPorts.map(p => ({ ...p, state: 'not_tested', responseTimeMs: null })),
+      messageFa:
+        'نتیجه نامشخص (تست‌نشده): از آنجا که سرور برنامه به آدرس عمومی مستقیم سوکت کلاینت دسترسی ندارد (اتصال محلی یا پشت پروکسی غیرمعتمد)، اسکن پورت TCP اجرا نشد تا از اسکن اشتباه سرور جلوگیری شود.',
+      messageEn:
+        'Inconclusive (Not Tested): Server observed a local/untrusted socket IP; TCP port probing was skipped to prevent SSRF or self-scanning.',
+    };
+  }
+
+  const openEntries = defaultPorts.filter(p => p.state === 'open');
+  const closedEntries = defaultPorts.filter(p => p.state === 'closed');
+  const filteredEntries = defaultPorts.filter(p => p.state === 'filtered_timeout');
+  const openPorts = openEntries.map(p => p.port);
+  const scannedCount = openEntries.length + closedEntries.length + filteredEntries.length;
+
+  if (scannedCount === 0) {
+    return {
+      status: 'INCONCLUSIVE',
+      testName: 'Common Router & Sensitive TCP Port Exposure Probe',
+      startedAt,
+      completedAt,
+      observations: ['هیچ پورتی در این نوبت مورد سنجش قرار نگرفت.'],
+      evidence: { targetIp, targetSource },
+      limitations: portLimitations,
+      errorCode: 'NO_PORTS_SCANNED',
+      source: 'Server TCP Socket Probe (/api/port-scan)',
+      confidence: 'low',
+      targetIp,
+      targetSource,
+      canScanFromServer: true,
+      scannedPortsCount: 0,
+      openPortsCount: 0,
+      closedPortsCount: 0,
+      filteredPortsCount: 0,
+      openPorts: [],
+      isExposingSensitivePorts: null,
+      ports: defaultPorts,
+      messageFa: 'نتیجه نامشخص: هیچ دادهٔ معتبری از وضعیت پورت‌ها ثبت نشد.',
+      messageEn: 'Inconclusive: No port probe results recorded.',
+    };
+  }
+
+  const hasCriticalOpen = openEntries.some(p => p.riskLevel === 'critical' || p.riskLevel === 'high');
+
+  if (openEntries.length > 0) {
+    return {
+      status: hasCriticalOpen ? 'LEAK_DETECTED' : 'WARNING',
+      testName: 'Common Router & Sensitive TCP Port Exposure Probe',
+      startedAt,
+      completedAt,
+      observations: [
+        `روی آدرس ${targetIp} تعداد ${openEntries.length} پورت باز (${openPorts.join(', ')}) به درخواست TCP SYN پاسخ مثبت دادند.`,
+        ...openEntries.map(
+          p => `پورت ${p.port} (${p.serviceName}) باز است — زمان پاسخ: ${p.responseTimeMs ?? 'نامشخص'} ms.`
+        ),
+      ],
+      evidence: {
+        targetIp,
+        targetSource,
+        openPorts,
+        openServices: openEntries.map(p => ({ port: p.port, service: p.serviceName, rttMs: p.responseTimeMs })),
+      },
+      limitations: portLimitations,
+      errorCode: null,
+      source: 'Server TCP Socket Probe (/api/port-scan)',
+      confidence: 'high',
+      targetIp,
+      targetSource,
+      canScanFromServer: true,
+      scannedPortsCount: scannedCount,
+      openPortsCount: openEntries.length,
+      closedPortsCount: closedEntries.length,
+      filteredPortsCount: filteredEntries.length,
+      openPorts,
+      isExposingSensitivePorts: true,
+      ports: defaultPorts,
+      messageFa: `هشدار نشت پورت: پورت‌های (${openPorts.join(', ')}) روی آدرس عمومی ${targetIp} باز هستند و ممکن است پنل مدیریت روتر یا سرویس‌های شبکه را افشا کنند!`,
+      messageEn: `Port Exposure Detected: Port(s) ${openPorts.join(', ')} responded as OPEN on ${targetIp}.`,
+    };
+  }
+
+  return {
+    status: 'PASS',
+    testName: 'Common Router & Sensitive TCP Port Exposure Probe',
+    startedAt,
+    completedAt,
+    observations: [
+      `تمامی ${scannedCount} پورت حساس بررسی‌شده روی آدرس ${targetIp} بسته (Closed: ${closedEntries.length}) یا توسط فایروال فیلتر (Filtered: ${filteredEntries.length}) هستند.`
+    ],
+    evidence: {
+      targetIp,
+      targetSource,
+      scannedCount,
+      closedCount: closedEntries.length,
+      filteredCount: filteredEntries.length,
+    },
+    limitations: portLimitations,
+    errorCode: null,
+    source: 'Server TCP Socket Probe (/api/port-scan)',
+    confidence: 'high',
+    targetIp,
+    targetSource,
+    canScanFromServer: true,
+    scannedPortsCount: scannedCount,
+    openPortsCount: 0,
+    closedPortsCount: closedEntries.length,
+    filteredPortsCount: filteredEntries.length,
+    openPorts: [],
+    isExposingSensitivePorts: false,
+    ports: defaultPorts,
+    messageFa: `تأییدشده با شواهد: از میان ${scannedCount} پورت حساس مدیریت روتر و پروکسی، هیچ پورت بازی روی آدرس ${targetIp} مشاهده نشد.`,
+    messageEn: `Verified: 0 open sensitive ports detected out of ${scannedCount} probed on ${targetIp}.`,
+  };
+}
+
 /**
  * Evaluates Overall Status and Privacy Score strictly from verified evidence.
  * If critical tests failed, timed out, or are unconfigured/inconclusive without sufficient evidence,
@@ -762,13 +1229,14 @@ export function evaluateOverallSummary(params: {
   dnsLeak: DnsLeakResult | null;
   webRtcLeak: WebRtcLeakResult | null;
   vpnProxy: VpnProxyResult | null;
+  portLeak?: PortLeakResult | null;
 }): {
   overallStatus: TestStatus;
   privacyScore: number | null;
   isScoreCalculable: boolean;
   reasonsFa: string[];
 } {
-  const { ipDetails, dnsLeak, webRtcLeak, vpnProxy } = params;
+  const { ipDetails, dnsLeak, webRtcLeak, vpnProxy, portLeak } = params;
   const reasonsFa: string[] = [];
 
   if (!ipDetails && !dnsLeak && !webRtcLeak) {
@@ -784,8 +1252,9 @@ export function evaluateOverallSummary(params: {
   const hasWebRtcLeak = webRtcLeak?.status === 'LEAK_DETECTED' || webRtcLeak?.isLeakingRealIp === true;
   const hasDnsLeak = dnsLeak?.status === 'LEAK_DETECTED' || dnsLeak?.isLeaking === true;
   const hasIpMismatch = ipDetails?.ipMismatchDetected === true;
+  const hasPortExposure = portLeak?.status === 'LEAK_DETECTED' || portLeak?.isExposingSensitivePorts === true;
 
-  if (hasWebRtcLeak || hasDnsLeak || hasIpMismatch) {
+  if (hasWebRtcLeak || hasDnsLeak || hasIpMismatch || hasPortExposure) {
     let score = 100;
     if (hasWebRtcLeak) {
       score -= 45;
@@ -798,6 +1267,10 @@ export function evaluateOverallSummary(params: {
     if (hasIpMismatch) {
       score -= 25;
       reasonsFa.push('عدم تطابق بین آدرس IP مشاهده‌شده در کلاینت و سرور برنامه شناسایی شد.');
+    }
+    if (hasPortExposure) {
+      score -= 25;
+      reasonsFa.push(`باز بودن پورت‌های حساس (${portLeak?.openPorts.join(', ')}) روی آدرس خروجی تأیید شد.`);
     }
     return {
       overallStatus: 'LEAK_DETECTED',
@@ -885,3 +1358,4 @@ export function evaluateOverallSummary(params: {
         : ['تمامی آزمون‌های IP، DNS و WebRTC با شواهد معتبر و بدون مشاهدهٔ نشت تکمیل شدند.'],
   };
 }
+

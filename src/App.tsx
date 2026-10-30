@@ -6,6 +6,7 @@ import {
   DnsLeakResult,
   WebRtcLeakResult,
   VpnProxyResult,
+  PortLeakResult,
   NetworkMetrics,
   AiAuditReport,
   FullNetworkTestReport
@@ -16,6 +17,7 @@ import {
   performDnsLeakTest,
   performWebRtcLeakTest,
   performVpnAnalysis,
+  performPortLeakTest,
   measurePingAndSpeed,
   fetchAiAudit
 } from './services/networkTester';
@@ -27,6 +29,7 @@ import { IpLeakCard } from './components/IpLeakCard';
 import { DnsLeakCard } from './components/DnsLeakCard';
 import { WebRtcCard } from './components/WebRtcCard';
 import { VpnProxyCard } from './components/VpnProxyCard';
+import { PortLeakCard } from './components/PortLeakCard';
 import { SpeedPingCard } from './components/SpeedPingCard';
 import { PrivacyScoreHistoryCard, ScoreHistoryPoint } from './components/PrivacyScoreHistoryCard';
 import { AiAuditSection } from './components/AiAuditSection';
@@ -70,6 +73,7 @@ export default function App() {
   const [dnsLeak, setDnsLeak] = useState<DnsLeakResult | null>(null);
   const [webRtcLeak, setWebRtcLeak] = useState<WebRtcLeakResult | null>(null);
   const [vpnProxy, setVpnProxy] = useState<VpnProxyResult | null>(null);
+  const [portLeak, setPortLeak] = useState<PortLeakResult | null>(null);
   const [metrics, setMetrics] = useState<NetworkMetrics | null>(null);
   const [aiAudit, setAiAudit] = useState<AiAuditReport | null>(null);
 
@@ -194,8 +198,12 @@ export default function App() {
       const dnsRes = await performDnsLeakTest(ipData);
       setDnsLeak(dnsRes);
 
-      const webRtcRes = await performWebRtcLeakTest(ipData.ip);
+      const [webRtcRes, portRes] = await Promise.all([
+        performWebRtcLeakTest(ipData.ip),
+        performPortLeakTest(),
+      ]);
       setWebRtcLeak(webRtcRes);
+      setPortLeak(portRes);
 
       const vpnRes = performVpnAnalysis(ipData, dnsRes);
       setVpnProxy(vpnRes);
@@ -209,6 +217,7 @@ export default function App() {
         dnsLeak: dnsRes,
         webRtcLeak: webRtcRes,
         vpnProxy: vpnRes,
+        portLeak: portRes,
       });
 
       setOverallStatus(summary.overallStatus);
@@ -246,6 +255,7 @@ export default function App() {
         dnsLeakStatus: dnsRes.status,
         dnsServerCount: dnsRes.detectedResolversCount,
         webRtcLeakStatus: webRtcRes.status,
+        portLeakStatus: portRes.status,
         localWebRtcIp: webRtcRes.localIps[0] || (webRtcRes.mdnsHosts[0] ?? 'مشاهده نشد'),
         pingMs: speedRes.pingMs,
         fraudRiskScore: ipData.fraudRiskScore,
@@ -261,8 +271,7 @@ export default function App() {
       } else if (summary.overallStatus === 'PASS') {
         playSuccessSound();
       }
-    } catch (e) {
-      console.error('Leak test execution error', e);
+    } catch {
       setOverallStatus('ERROR');
       setPrivacyScore(null);
       setIsScoreCalculable(false);
@@ -299,12 +308,18 @@ export default function App() {
     }
   }, []);
 
+  const handleRetestPorts = useCallback(async () => {
+    const res = await performPortLeakTest();
+    setPortLeak(res);
+  }, []);
+
   const fullReport: FullNetworkTestReport = {
     timestamp: new Date().toLocaleString('fa-IR'),
     ipDetails,
     dnsLeak,
     webRtcLeak,
     vpnProxy,
+    portLeak,
     metrics,
     aiAudit,
     overallStatus,
@@ -410,6 +425,12 @@ export default function App() {
           <DnsLeakCard dnsLeak={dnsLeak} lang={lang} />
           <WebRtcCard webRtcLeak={webRtcLeak} lang={lang} />
           <VpnProxyCard vpnProxy={vpnProxy} lang={lang} />
+          <PortLeakCard
+            portLeak={portLeak}
+            onRetestPorts={handleRetestPorts}
+            isTesting={isTesting}
+            lang={lang}
+          />
           <SpeedPingCard metrics={metrics} onUpdateMetrics={setMetrics} lang={lang} />
           
           {/* Windows & Android Branding & App Center Card */}

@@ -71,6 +71,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({ isOpen, onClose, repor
       ['سرویس دهنده / ISP', report.ipDetails?.isp || 'نامشخص'],
       ['وضعیت تست نشت DNS / DNS Leak Status', formatTestStatusFa(report.dnsLeak?.status)],
       ['وضعیت تست نشت WebRTC / WebRTC Leak Status', formatTestStatusFa(report.webRtcLeak?.status)],
+      ['وضعیت پورت‌های حساس / Port Exposure Status', formatTestStatusFa(report.portLeak?.status)],
       ['ارزیابی احتمالی VPN / VPN Assessment', report.vpnProxy?.messageFa || 'نامشخص'],
       ['میانگین تاخیر HTTP RTT / HTTP RTT (ms)', report.metrics?.pingMs !== null && report.metrics?.pingMs !== undefined ? String(report.metrics.pingMs) : 'نامشخص'],
       ['امتیاز کلی امنیت / Privacy Score', scoreLabel],
@@ -106,8 +107,8 @@ export const ExportModal: React.FC<ExportModalProps> = ({ isOpen, onClose, repor
 
       pdf.addImage(imgData, 'PNG', 0, 0, pdfWidth, pdfHeight);
       pdf.save(`LeakGuard_Security_Report_${Date.now()}.pdf`);
-    } catch (e) {
-      console.error('PDF export error', e);
+    } catch {
+      // PDF rendering error handled gracefully
     } finally {
       setIsExportingPdf(false);
     }

@@ -1,8 +1,11 @@
 import {
   IpDetails,
   DnsLeakResult,
+  IndependentBrowserDnsEntry,
+  IndependentBrowserDnsObservation,
   WebRtcLeakResult,
   VpnProxyResult,
+  PortLeakResult,
   OptimalVpnNodeSuggestion,
   EncryptedDnsRecommendation,
   NetworkMetrics,
@@ -14,11 +17,14 @@ import {
   isValidIpv4,
   isValidIpv6,
   isPrivateOrLocalAddress,
+  formatTestStatusLabelFa,
   parseIceCandidateLine,
   evaluateWebRtcCandidates,
   evaluateDnsTestResult,
+  evaluateIndependentBrowserDnsObservation,
   evaluateVpnHeuristic,
-  calculateHttpPingMetrics
+  calculateHttpPingMetrics,
+  evaluatePortLeakResult
 } from '../utils/networkEvaluator';
 
 function generateCryptoRunId(): string {
@@ -384,26 +390,103 @@ export async function fetchIpDetails(): Promise<IpDetails> {
 }
 
 /**
- * 2. Perform Authoritative DNS Leak Test
+ * 2A. Independent Zero-Cost Browser DNS & Edge Trace Observation
+ * Queries public endpoints (edns.ip-api.com & 1.1.1.1/cdn-cgi/trace) directly from the browser.
+ * Never fabricates any resolver on failure, and is strictly separated from Authoritative DNS Leak testing.
+ */
+async function probeIndependentBrowserDnsObservation(
+  ipDetails: IpDetails | null
+): Promise<IndependentBrowserDnsObservation> {
+  const entries: IndependentBrowserDnsEntry[] = [];
+
+  await Promise.allSettled([
+    (async () => {
+      const t0 = performance.now();
+      const resp = await fetch(`https://edns.ip-api.com/json?nocache=${Date.now()}`, {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(4000),
+      });
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const rtt = Math.max(1, Math.round(performance.now() - t0));
+      if (data?.dns?.ip && (isValidIpv4(String(data.dns.ip)) || isValidIpv6(String(data.dns.ip)))) {
+        entries.push({
+          sourceName: 'ip-api EDNS Recursive Resolver',
+          observedIp: String(data.dns.ip),
+          locationOrGeo: String(data.dns.geo || 'نامشخص'),
+          role: 'edns_recursive_resolver',
+          responseTimeMs: rtt,
+        });
+      }
+      if (data?.edns?.ip && (isValidIpv4(String(data.edns.ip)) || isValidIpv6(String(data.edns.ip)))) {
+        entries.push({
+          sourceName: 'EDNS Client Subnet (ECS)',
+          observedIp: String(data.edns.ip),
+          locationOrGeo: String(data.edns.geo || 'نامشخص'),
+          role: 'client_subnet_edns',
+          responseTimeMs: rtt,
+        });
+      }
+    })(),
+    (async () => {
+      const t0 = performance.now();
+      const resp = await fetch('https://1.1.1.1/cdn-cgi/trace', {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(3500),
+      });
+      if (!resp.ok) return;
+      const text = await resp.text();
+      const rtt = Math.max(1, Math.round(performance.now() - t0));
+      const map: Record<string, string> = {};
+      for (const line of text.split('\n')) {
+        const idx = line.indexOf('=');
+        if (idx > 0) {
+          map[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
+        }
+      }
+      if (map.ip && (isValidIpv4(map.ip) || isValidIpv6(map.ip))) {
+        entries.push({
+          sourceName: `Cloudflare Edge Trace (${map.colo || 'Anycast'})`,
+          observedIp: map.ip,
+          locationOrGeo: `${map.loc || 'نامشخص'}${map.warp && map.warp !== 'off' ? ` (WARP: ${map.warp})` : ''}`,
+          role: 'edge_trace_egress',
+          responseTimeMs: rtt,
+        });
+      }
+    })(),
+  ]);
+
+  return evaluateIndependentBrowserDnsObservation(entries, ipDetails);
+}
+
+/**
+ * 2. Perform Authoritative DNS Leak Test + Independent Zero-Cost Browser DNS Comparison
  * Uses unique cryptographic per-run token. Never returns fake resolvers or random latencies.
  */
 export async function performDnsLeakTest(ipDetails: IpDetails | null): Promise<DnsLeakResult> {
   const startedAt = new Date().toISOString();
   const runId = generateCryptoRunId();
 
+  const independentPromise = probeIndependentBrowserDnsObservation(ipDetails);
+
   try {
-    const res = await fetch(`/api/dns-leak-probe?runId=${encodeURIComponent(runId)}`, {
-      cache: 'no-store',
-      signal: AbortSignal.timeout(6000),
-    });
+    const [res, independentBrowserObservation] = await Promise.all([
+      fetch(`/api/dns-leak-probe?runId=${encodeURIComponent(runId)}`, {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(6000),
+      }),
+      independentPromise,
+    ]);
 
     if (!res.ok) {
       const errBody = await res.json().catch(() => ({}));
       return evaluateDnsTestResult({
         runId,
         authoritativeConfigured: Boolean(errBody?.authoritativeConfigured),
+        missingEnvVars: Array.isArray(errBody?.missingEnvVars) ? errBody.missingEnvVars : undefined,
         resolvers: [],
         ipDetails,
+        independentBrowserObservation,
         startedAt,
         completedAt: new Date().toISOString(),
         errorMessage: errBody?.error || `HTTP ${res.status}`,
@@ -412,6 +495,7 @@ export async function performDnsLeakTest(ipDetails: IpDetails | null): Promise<D
 
     const json = await res.json();
     const authoritativeConfigured = Boolean(json.authoritativeConfigured);
+    const missingEnvVars = Array.isArray(json.missingEnvVars) ? json.missingEnvVars : undefined;
     const dnsLeakDomain = json.dnsLeakDomain as string | null;
 
     // If an authoritative DNS domain IS configured, trigger 3 unique cache-bypassing subqueries from the browser
@@ -435,8 +519,10 @@ export async function performDnsLeakTest(ipDetails: IpDetails | null): Promise<D
         return evaluateDnsTestResult({
           runId,
           authoritativeConfigured: true,
+          missingEnvVars: [],
           resolvers: Array.isArray(collectJson.resolvers) ? collectJson.resolvers : [],
           ipDetails,
+          independentBrowserObservation,
           startedAt,
           completedAt: new Date().toISOString(),
         });
@@ -446,17 +532,23 @@ export async function performDnsLeakTest(ipDetails: IpDetails | null): Promise<D
     return evaluateDnsTestResult({
       runId,
       authoritativeConfigured,
+      missingEnvVars,
       resolvers: Array.isArray(json.resolvers) ? json.resolvers : [],
       ipDetails,
+      independentBrowserObservation,
       startedAt,
       completedAt: new Date().toISOString(),
     });
   } catch (e: any) {
+    const independentBrowserObservation = await independentPromise.catch(() =>
+      evaluateIndependentBrowserDnsObservation([], ipDetails)
+    );
     return evaluateDnsTestResult({
       runId,
       authoritativeConfigured: false,
       resolvers: [],
       ipDetails,
+      independentBrowserObservation,
       startedAt,
       completedAt: new Date().toISOString(),
       errorMessage: e?.message || 'خطای شبکه در ارتباط با سرویس تست DNS',
@@ -596,6 +688,54 @@ export function performVpnAnalysis(
 }
 
 /**
+ * 4.5 Real TCP Port Exposure & Router Admin Port Test
+ * Queries /api/port-scan (which only scans a verified public socket IP to prevent SSRF)
+ * and evaluates results without fabricating open/closed states.
+ */
+export async function performPortLeakTest(signal?: AbortSignal): Promise<PortLeakResult> {
+  const startedAt = new Date().toISOString();
+  try {
+    const resp = await fetch(`/api/port-scan?t=${Date.now()}`, {
+      cache: 'no-store',
+      signal: signal || AbortSignal.timeout(7500),
+    });
+
+    if (!resp.ok) {
+      const errJson = await resp.json().catch(() => ({}));
+      return evaluatePortLeakResult({
+        targetIp: null,
+        targetSource: 'unverifiable_local_socket',
+        canScanFromServer: false,
+        ports: [],
+        startedAt,
+        completedAt: new Date().toISOString(),
+        errorMessage: errJson?.error || `HTTP ${resp.status}`,
+      });
+    }
+
+    const json = await resp.json();
+    return evaluatePortLeakResult({
+      targetIp: json.targetIp || null,
+      targetSource: json.targetSource || 'unverifiable_local_socket',
+      canScanFromServer: Boolean(json.canScanFromServer),
+      ports: Array.isArray(json.ports) ? json.ports : [],
+      startedAt: json.startedAt || startedAt,
+      completedAt: json.completedAt || new Date().toISOString(),
+    });
+  } catch (e: any) {
+    return evaluatePortLeakResult({
+      targetIp: null,
+      targetSource: 'unverifiable_local_socket',
+      canScanFromServer: false,
+      ports: [],
+      startedAt,
+      completedAt: new Date().toISOString(),
+      errorMessage: e?.message || 'خطا در ارتباط با سرویس بررسی پورت‌ها',
+    });
+  }
+}
+
+/**
  * 5. Real HTTP RTT Latency, Jitter, Packet Loss & Bounded Download Speed Measurement
  * Never fabricates random ping numbers or fake download speeds on failure.
  */
@@ -687,7 +827,7 @@ export async function fetchAiAudit(networkData: any): Promise<AiAuditReport> {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ networkData }),
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(9000),
     });
     if (res.ok) {
       const json = await res.json();
@@ -703,6 +843,12 @@ export async function fetchAiAudit(networkData: any): Promise<AiAuditReport> {
     // Handled below without fabricating fake positive security claims
   }
 
+  const dnsStatusFa = formatTestStatusLabelFa(networkData?.dnsLeakStatus || 'NOT_CONFIGURED');
+  const webRtcStatusFa = formatTestStatusLabelFa(networkData?.webRtcLeakStatus || 'INCONCLUSIVE');
+  const portStatusFa = networkData?.portLeakStatus
+    ? formatTestStatusLabelFa(networkData.portLeakStatus)
+    : null;
+
   return {
     riskScore: null,
     statusLevel: 'نامشخص',
@@ -712,12 +858,13 @@ export async function fetchAiAudit(networkData: any): Promise<AiAuditReport> {
       networkData?.ip
         ? `آدرس IP مشاهده‌شده: ${networkData.ip} (${networkData.usageTypeFa || 'نامشخص'})`
         : 'آدرس IP عمومی دریافت نشد (خطای شبکه).',
-      `وضعیت تست DNS: ${networkData?.dnsLeakStatus || 'تنظیم‌نشده (not_configured)'}`,
-      `وضعیت تست WebRTC: ${networkData?.webRtcLeakStatus || 'نامشخص'}`,
+      `وضعیت تست Authoritative DNS: ${dnsStatusFa}`,
+      `وضعیت تست WebRTC: ${webRtcStatusFa}`,
+      ...(portStatusFa ? [`وضعیت بررسی پورت‌های حساس روتر: ${portStatusFa}`] : []),
     ],
     threatsFoundFa: [],
     recommendationsFa: [
-      'برای اثبات قطعی عدم نشت DNS، دامنهٔ Authoritative DNS اختصاصی (DNS_LEAK_DOMAIN) باید روی سرور تنظیم شود.',
+      'برای اثبات قطعی عدم نشت DNS، متغیرهای DNS_LEAK_DOMAIN، DNS_COLLECTOR_API_URL و DNS_COLLECTOR_API_TOKEN باید روی سرور تنظیم شوند.',
       'توجه داشته باشید که تست‌های داخل مرورگر، وضعیت تمام ترافیک سطح سیستم‌عامل را اثبات نمی‌کنند.'
     ],
     optimalNodeSuggestion: nodeSuggestion,

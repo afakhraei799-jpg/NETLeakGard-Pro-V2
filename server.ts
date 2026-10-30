@@ -1,11 +1,16 @@
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
+import fs from 'node:fs';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import dns from 'node:dns';
 import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
+import {
+  isGloballyRoutablePublicIp,
+  formatTestStatusLabelFa
+} from './src/utils/networkEvaluator';
 
 dotenv.config();
 
@@ -47,26 +52,40 @@ function getGeminiClient() {
 }
 
 function normalizeIp(rawIp: string | undefined | null): string | null {
-  if (!rawIp) return null;
+  if (!rawIp || typeof rawIp !== 'string') return null;
   let cleaned = rawIp.trim();
-  if (cleaned.startsWith('::ffff:')) {
+  if (cleaned.toLowerCase().startsWith('::ffff:')) {
     cleaned = cleaned.slice(7);
+  } else if (cleaned.toLowerCase().startsWith('0:0:0:0:0:ffff:')) {
+    cleaned = cleaned.slice(15);
   }
   return net.isIP(cleaned) ? cleaned : null;
 }
 
-function isPublicRoutableIp(ip: string): boolean {
-  if (!net.isIP(ip)) return false;
-  if (ip === '127.0.0.1' || ip === '::1') return false;
-  if (ip.startsWith('10.') || ip.startsWith('192.168.') || ip.startsWith('169.254.')) return false;
-  if (ip.startsWith('172.')) {
-    const second = parseInt(ip.split('.')[1] || '0', 10);
-    if (second >= 16 && second <= 31) return false;
+function isPublicRoutableIp(ip: string | undefined | null): boolean {
+  if (!ip) return false;
+  const normalized = normalizeIp(ip);
+  if (!normalized) return false;
+  return isGloballyRoutablePublicIp(normalized);
+}
+
+function isSafeExternalUrl(rawUrl: string): { valid: boolean; url?: URL; reason?: string } {
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      return { valid: false, reason: 'پروتکل آدرس باید HTTP یا HTTPS باشد.' };
+    }
+    const host = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+    if (host === 'localhost' || host.endsWith('.local') || host.endsWith('.internal')) {
+      return { valid: false, reason: 'آدرس‌های میزبان محلی (localhost / .local) مجاز نیستند.' };
+    }
+    if (net.isIP(host) && !isPublicRoutableIp(host)) {
+      return { valid: false, reason: 'آدرس IP خصوصی، Loopback یا Link-Local در URL مجاز نیست.' };
+    }
+    return { valid: true, url: parsed };
+  } catch {
+    return { valid: false, reason: 'ساختار URL نامعتبر است.' };
   }
-  if (ip.toLowerCase().startsWith('fe80:') || ip.toLowerCase().startsWith('fc') || ip.toLowerCase().startsWith('fd')) {
-    return false;
-  }
-  return true;
 }
 
 // 1. Endpoint: Evidence-based Client & Server IP Inspection, GeoIP Estimation & Real Reputation Check
@@ -106,13 +125,14 @@ app.get('/api/ip-info', rateLimit(30, 60_000), async (req, res) => {
 
     const lookupErrors: string[] = [];
 
-    // Primary GeoIP lookup: ipwho.is (supports HTTPS, no key required for basic GeoIP)
+    // Primary GeoIP lookup: ipwho.is (supports HTTPS, no key required for basic GeoIP, redirects forbidden)
     try {
       const endpoint = targetLookupIp
         ? `https://ipwho.is/${encodeURIComponent(targetLookupIp)}`
         : 'https://ipwho.is/';
       const resp = await fetch(endpoint, {
         headers: { 'Accept': 'application/json', 'User-Agent': 'NETLeakGard-Auditor/2.0' },
+        redirect: 'error',
         signal: AbortSignal.timeout(4500),
       });
       if (resp.ok) {
@@ -142,7 +162,7 @@ app.get('/api/ip-info', rateLimit(30, 60_000), async (req, res) => {
       lookupErrors.push(`ipwho.is error: ${e?.message || 'timeout'}`);
     }
 
-    // Secondary independent GeoIP lookup if primary failed: ipapi.co
+    // Secondary independent GeoIP lookup if primary failed: ipapi.co (redirects forbidden)
     if (!geoData) {
       try {
         const endpoint2 = targetLookupIp
@@ -150,6 +170,7 @@ app.get('/api/ip-info', rateLimit(30, 60_000), async (req, res) => {
           : 'https://ipapi.co/json/';
         const resp2 = await fetch(endpoint2, {
           headers: { 'Accept': 'application/json', 'User-Agent': 'NETLeakGard-Auditor/2.0' },
+          redirect: 'error',
           signal: AbortSignal.timeout(4500),
         });
         if (resp2.ok) {
@@ -247,6 +268,7 @@ app.get('/api/ip-info', rateLimit(30, 60_000), async (req, res) => {
               'Key': abuseKey.trim(),
               'Accept': 'application/json',
             },
+            redirect: 'error',
             signal: AbortSignal.timeout(4000),
           }
         );
@@ -406,6 +428,29 @@ app.get('/api/ip-info', rateLimit(30, 60_000), async (req, res) => {
   }
 });
 
+// 1.5 Endpoint: Configuration & Health Check (Zero secret exposure, never crashes on missing optional keys)
+app.get('/api/health', (_req, res) => {
+  const dnsLeakDomain = (process.env.DNS_LEAK_DOMAIN || '').trim();
+  const collectorApiUrl = (process.env.DNS_COLLECTOR_API_URL || '').trim();
+  const collectorToken = (process.env.DNS_COLLECTOR_API_TOKEN || '').trim();
+  const missingDnsEnvVars: string[] = [];
+  if (!dnsLeakDomain) missingDnsEnvVars.push('DNS_LEAK_DOMAIN');
+  if (!collectorApiUrl) missingDnsEnvVars.push('DNS_COLLECTOR_API_URL');
+  if (!collectorToken) missingDnsEnvVars.push('DNS_COLLECTOR_API_TOKEN');
+
+  res.json({
+    ok: true,
+    timestamp: new Date().toISOString(),
+    optionalIntegrations: {
+      authoritativeDnsConfigured: missingDnsEnvVars.length === 0,
+      missingDnsEnvVars,
+      abuseIpDbConfigured: Boolean((process.env.ABUSEIPDB_API_KEY || '').trim()),
+      googleSafeBrowsingConfigured: Boolean((process.env.GOOGLE_SAFE_BROWSING_API_KEY || '').trim()),
+      geminiConfigured: Boolean(getGeminiClient()),
+    },
+  });
+});
+
 // 2. Endpoint: Real Authoritative DNS Leak Session & Collector Query (Zero Fake Resolvers)
 app.get('/api/dns-leak-probe', rateLimit(30, 60_000), async (req, res) => {
   const startedAt = new Date().toISOString();
@@ -418,7 +463,12 @@ app.get('/api/dns-leak-probe', rateLimit(30, 60_000), async (req, res) => {
   const collectorApiUrl = (process.env.DNS_COLLECTOR_API_URL || '').trim();
   const collectorToken = (process.env.DNS_COLLECTOR_API_TOKEN || '').trim();
 
-  const authoritativeConfigured = Boolean(dnsLeakDomain && collectorApiUrl);
+  const missingEnvVars: string[] = [];
+  if (!dnsLeakDomain) missingEnvVars.push('DNS_LEAK_DOMAIN');
+  if (!collectorApiUrl) missingEnvVars.push('DNS_COLLECTOR_API_URL');
+  if (!collectorToken) missingEnvVars.push('DNS_COLLECTOR_API_TOKEN');
+
+  const authoritativeConfigured = missingEnvVars.length === 0;
 
   try {
     if (!authoritativeConfigured) {
@@ -431,26 +481,39 @@ app.get('/api/dns-leak-probe', rateLimit(30, 60_000), async (req, res) => {
         startedAt,
         completedAt: new Date().toISOString(),
         authoritativeConfigured: false,
+        missingEnvVars,
         dnsLeakDomain: null,
         serverSystemResolvers: serverSystemDns,
         resolvers: [],
         messageFa:
-          'دامنهٔ Authoritative DNS (متغیر محیطی DNS_LEAK_DOMAIN) و وب‌هوک جمع‌آوری لاگ (DNS_COLLECTOR_API_URL) تنظیم نشده‌اند. هیچ سرور DNS ساختگی تولید نشد.',
+          `وضعیت: پیکربندی نشده — متغیرهای محیطی (${missingEnvVars.join('، ')}) تنظیم نشده‌اند. بدون سرور Authoritative DNS اختصاصی، هیچ نتیجه‌ای به عنوان موفق یا امن جعل نمی‌شود.`,
       });
     }
 
-    // When DNS_LEAK_DOMAIN and DNS_COLLECTOR_API_URL are configured:
-    // Query the authoritative DNS collector for queries matching runId
-    const url = new URL(collectorApiUrl);
+    // When DNS_LEAK_DOMAIN, DNS_COLLECTOR_API_URL, and DNS_COLLECTOR_API_TOKEN are all configured:
+    // Validate collectorApiUrl against SSRF & private/loopback targets and forbid HTTP redirects
+    const urlCheck = isSafeExternalUrl(collectorApiUrl);
+    if (!urlCheck.valid || !urlCheck.url) {
+      return res.status(400).json({
+        success: false,
+        runId,
+        authoritativeConfigured: true,
+        errorCode: 'UNSAFE_COLLECTOR_URL',
+        error: `آدرس سرویس ثبت‌کنندهٔ DNS نامعتبر یا ناامن است: ${urlCheck.reason || 'Invalid URL'}`,
+      });
+    }
+
+    const url = urlCheck.url;
     url.searchParams.set('runId', runId);
 
-    const headers: Record<string, string> = { Accept: 'application/json' };
-    if (collectorToken) {
-      headers['Authorization'] = `Bearer ${collectorToken}`;
-    }
+    const headers: Record<string, string> = {
+      Accept: 'application/json',
+      Authorization: `Bearer ${collectorToken}`,
+    };
 
     const collectorResp = await fetch(url.toString(), {
       headers,
+      redirect: 'error',
       signal: AbortSignal.timeout(5000),
     });
 
@@ -516,51 +579,265 @@ app.get('/api/speed-test/chunk', rateLimit(20, 60_000), (req, res) => {
   res.send(buffer);
 });
 
-// 4. Endpoint: Gemini AI Security & Privacy Audit (in Persian, strictly grounded in real evidence)
-app.post('/api/gemini-audit', rateLimit(15, 60_000), async (req, res) => {
-  try {
-    const gemini = getGeminiClient();
-    const { networkData } = req.body || {};
+// 3.5 Endpoint: Real TCP Port Exposure Probe against Verified Client Public IP (SSRF-safe)
+const SENSITIVE_PORT_DEFINITIONS = [
+  {
+    port: 80,
+    protocol: 'TCP' as const,
+    serviceName: 'HTTP Router Admin',
+    category: 'router_admin' as const,
+    descriptionFa: 'پنل وب مدیریت مودم/روتر (HTTP غیررمزنگاری‌شده)',
+    descriptionEn: 'Unencrypted Router/Modem Web Admin Panel (HTTP)',
+    riskLevel: 'critical' as const,
+  },
+  {
+    port: 443,
+    protocol: 'TCP' as const,
+    serviceName: 'HTTPS Admin / TLS',
+    category: 'router_admin' as const,
+    descriptionFa: 'پنل مدیریت وب رمزنگاری‌شده (HTTPS WAN Admin)',
+    descriptionEn: 'Encrypted Web Management / TLS Service',
+    riskLevel: 'medium' as const,
+  },
+  {
+    port: 8080,
+    protocol: 'TCP' as const,
+    serviceName: 'HTTP Alt / Router WAN',
+    category: 'router_admin' as const,
+    descriptionFa: 'پورت جایگزین مدیریت از راه دور روتر یا پروکسی HTTP',
+    descriptionEn: 'Alternative Router Remote Management or HTTP Proxy',
+    riskLevel: 'critical' as const,
+  },
+  {
+    port: 8291,
+    protocol: 'TCP' as const,
+    serviceName: 'MikroTik Winbox',
+    category: 'router_admin' as const,
+    descriptionFa: 'پورت اختصاصی مدیریت روترهای MikroTik (Winbox)',
+    descriptionEn: 'MikroTik RouterOS Winbox Management Port',
+    riskLevel: 'critical' as const,
+  },
+  {
+    port: 22,
+    protocol: 'TCP' as const,
+    serviceName: 'SSH Remote Shell',
+    category: 'remote_access' as const,
+    descriptionFa: 'پورت خط فرمان راه دور (SSH) روی روتر یا سرور',
+    descriptionEn: 'Secure Shell (SSH) Remote Access',
+    riskLevel: 'high' as const,
+  },
+  {
+    port: 23,
+    protocol: 'TCP' as const,
+    serviceName: 'Telnet Legacy Admin',
+    category: 'remote_access' as const,
+    descriptionFa: 'پورت مدیریت متنی ناامن (Telnet) با خطر افشای گذرواژه',
+    descriptionEn: 'Unencrypted Telnet Remote Console',
+    riskLevel: 'critical' as const,
+  },
+  {
+    port: 21,
+    protocol: 'TCP' as const,
+    serviceName: 'FTP File Server',
+    category: 'file_share' as const,
+    descriptionFa: 'سرویس اشتراک فایل FTP روی مودم/روتر (USB Share)',
+    descriptionEn: 'FTP File Sharing Service',
+    riskLevel: 'high' as const,
+  },
+  {
+    port: 1080,
+    protocol: 'TCP' as const,
+    serviceName: 'SOCKS Proxy',
+    category: 'proxy_relay' as const,
+    descriptionFa: 'پورت پیش‌فرض پروکسی SOCKS4/5 باز در سمت کلاینت',
+    descriptionEn: 'Open SOCKS Proxy Port',
+    riskLevel: 'critical' as const,
+  },
+];
 
-    if (!networkData || typeof networkData !== 'object') {
+function probeSingleTcpPort(
+  host: string,
+  port: number,
+  timeoutMs = 1200
+): Promise<{ state: 'open' | 'closed' | 'filtered_timeout'; responseTimeMs: number | null }> {
+  return new Promise(resolve => {
+    const startMs = Date.now();
+    const socket = new net.Socket();
+    let settled = false;
+
+    const finalize = (state: 'open' | 'closed' | 'filtered_timeout', responseTimeMs: number | null) => {
+      if (settled) return;
+      settled = true;
+      try {
+        socket.destroy();
+      } catch {
+        // Ignore socket destroy error
+      }
+      resolve({ state, responseTimeMs });
+    };
+
+    socket.setTimeout(timeoutMs);
+
+    socket.once('connect', () => {
+      finalize('open', Math.max(1, Date.now() - startMs));
+    });
+
+    socket.once('timeout', () => {
+      finalize('filtered_timeout', null);
+    });
+
+    socket.once('error', (err: any) => {
+      if (err && err.code === 'ECONNREFUSED') {
+        finalize('closed', Math.max(1, Date.now() - startMs));
+      } else {
+        finalize('filtered_timeout', null);
+      }
+    });
+
+    try {
+      socket.connect(port, host);
+    } catch {
+      finalize('filtered_timeout', null);
+    }
+  });
+}
+
+app.get('/api/port-scan', rateLimit(15, 60_000), async (req, res) => {
+  const startedAt = new Date().toISOString();
+  try {
+    // Explicitly reject any attempt to supply custom scan targets, hosts, ports, or redirect URLs via query params (SSRF prevention)
+    const forbiddenOverrideParams = ['ip', 'host', 'target', 'port', 'ports', 'url', 'redirect', 'dest', 'address'];
+    const attemptedOverrides = forbiddenOverrideParams.filter(key => req.query[key] !== undefined);
+    if (attemptedOverrides.length > 0) {
       return res.status(400).json({
         success: false,
-        error: 'داده‌های ورودی برای تحلیل ارسال نشده است.'
+        startedAt,
+        completedAt: new Date().toISOString(),
+        errorCode: 'SSRF_TARGET_OVERRIDE_FORBIDDEN',
+        error: `تعیین دستی آدرس هدف یا پورت از طریق پارامترهای درخواست (${attemptedOverrides.join(', ')}) به دلایل امنیتی (جلوگیری از SSRF) مسدود است. اسکن فقط روی سوکت عمومی تأییدشدهٔ کلاینت مجاز است.`,
       });
     }
 
-    if (!gemini) {
+    const trustProxy = process.env.TRUST_PROXY === 'true';
+    const rawSocketIp = normalizeIp(req.socket.remoteAddress);
+    const rawForwarded =
+      (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
+      (req.headers['cf-connecting-ip'] as string)?.trim() ||
+      null;
+    const forwardedHeaderIp = normalizeIp(rawForwarded);
+
+    // Strictly determine verified client socket IP — NEVER scan arbitrary query-supplied IPs (SSRF prevention)
+    const candidateIp = trustProxy && forwardedHeaderIp ? forwardedHeaderIp : rawSocketIp;
+    const isRoutablePublic = Boolean(candidateIp && isPublicRoutableIp(candidateIp));
+
+    if (!candidateIp || !isRoutablePublic) {
       return res.json({
         success: true,
-        aiAvailable: false,
-        audit: {
-          riskScore: null,
-          statusLevel: 'نامشخص',
-          summaryFa:
-            'کلید GEMINI_API_KEY در محیط سرور تنظیم نشده است. گزارش زیر صرفاً بر اساس قواعد قطعی و شواهد جمع‌آوری‌شده از تست‌ها تولید شده است.',
-          detailedAnalysisFa: [
-            networkData.ip
-              ? `آدرس IP عمومی مشاهده‌شده: ${networkData.ip} (${networkData.usageTypeFa || 'نامشخص'})`
-              : 'آدرس IP عمومی به دلیل خطا قابل مشاهده نبود.',
-            `وضعیت تست DNS: ${networkData.dnsLeakStatus || 'تنظیم‌نشده (not_configured)'}`,
-            `وضعیت تست WebRTC: ${networkData.webRtcLeakStatus || 'نامشخص'}`,
-          ],
-          threatsFoundFa: [],
-          recommendationsFa: [
-            'برای اجرای تست کامل Authoritative DNS، دامنهٔ اختصاصی DNS_LEAK_DOMAIN را در سرور پیکربندی کنید.',
-            'در صورت استفاده از VPN، قابلیت Kill Switch سطح سیستم‌عامل را فعال نگه دارید.'
-          ],
-          aiAvailable: false,
-        }
+        startedAt,
+        completedAt: new Date().toISOString(),
+        targetIp: candidateIp,
+        targetSource: 'unverifiable_local_socket',
+        canScanFromServer: false,
+        ports: SENSITIVE_PORT_DEFINITIONS.map(def => ({
+          ...def,
+          state: 'not_tested',
+          responseTimeMs: null,
+        })),
       });
     }
 
+    const targetSource =
+      trustProxy && forwardedHeaderIp ? 'trusted_proxy_header' : 'server_socket';
+
+    const probeResults = await Promise.all(
+      SENSITIVE_PORT_DEFINITIONS.map(async def => {
+        const resProbe = await probeSingleTcpPort(candidateIp, def.port, 1200);
+        return {
+          ...def,
+          state: resProbe.state,
+          responseTimeMs: resProbe.responseTimeMs,
+        };
+      })
+    );
+
+    return res.json({
+      success: true,
+      startedAt,
+      completedAt: new Date().toISOString(),
+      targetIp: candidateIp,
+      targetSource,
+      canScanFromServer: true,
+      ports: probeResults,
+    });
+  } catch (err: any) {
+    return res.status(500).json({
+      success: false,
+      errorCode: 'PORT_SCAN_FAILED',
+      error: `خطا در بررسی پورت‌ها: ${err?.message || 'Internal error'}`,
+    });
+  }
+});
+
+function buildRuleBasedAuditReport(networkData: any, fallbackSummaryFa: string) {
+  const dnsStatusFa = formatTestStatusLabelFa(networkData?.dnsLeakStatus || 'NOT_CONFIGURED');
+  const webRtcStatusFa = formatTestStatusLabelFa(networkData?.webRtcLeakStatus || 'INCONCLUSIVE');
+  const portStatusFa = networkData?.portLeakStatus
+    ? formatTestStatusLabelFa(networkData.portLeakStatus)
+    : null;
+
+  return {
+    riskScore: null,
+    statusLevel: 'نامشخص' as const,
+    summaryFa: fallbackSummaryFa,
+    detailedAnalysisFa: [
+      networkData?.ip
+        ? `آدرس IP عمومی مشاهده‌شده: ${networkData.ip} (${networkData.usageTypeFa || 'نامشخص'})`
+        : 'آدرس IP عمومی به دلیل خطا قابل مشاهده نبود.',
+      `وضعیت تست Authoritative DNS: ${dnsStatusFa}`,
+      `وضعیت تست WebRTC: ${webRtcStatusFa}`,
+      ...(portStatusFa ? [`وضعیت بررسی پورت‌های حساس روتر: ${portStatusFa}`] : []),
+    ],
+    threatsFoundFa: [],
+    recommendationsFa: [
+      'برای اجرای تست کامل Authoritative DNS، متغیرهای DNS_LEAK_DOMAIN، DNS_COLLECTOR_API_URL و DNS_COLLECTOR_API_TOKEN را در سرور پیکربندی کنید.',
+      'توجه داشته باشید که تست‌های داخل مرورگر، وضعیت تمام ترافیک سطح سیستم‌عامل را اثبات نمی‌کنند.'
+    ],
+    aiAvailable: false,
+    generatedAt: new Date().toISOString(),
+  };
+}
+
+// 4. Endpoint: Gemini AI Security & Privacy Audit (in Persian, strictly grounded in real evidence)
+app.post('/api/gemini-audit', rateLimit(15, 60_000), async (req, res) => {
+  const { networkData } = req.body || {};
+
+  if (!networkData || typeof networkData !== 'object' || Array.isArray(networkData)) {
+    return res.status(400).json({
+      success: false,
+      errorCode: 'INVALID_AUDIT_PAYLOAD',
+      error: 'داده‌های ورودی برای تحلیل ارسال نشده یا نامعتبر است.'
+    });
+  }
+
+  const gemini = getGeminiClient();
+  if (!gemini) {
+    return res.json({
+      success: true,
+      aiAvailable: false,
+      audit: buildRuleBasedAuditReport(
+        networkData,
+        'کلید GEMINI_API_KEY در محیط سرور تنظیم نشده است. گزارش زیر صرفاً بر اساس قواعد قطعی و شواهد جمع‌آوری‌شده از تست‌ها تولید شده است.'
+      ),
+    });
+  }
+
+  try {
     const prompt = `
 شما یک ممیز ارشد امنیت شبکه هستید. بر اساس داده‌های واقعی زیر (بدون هیچ‌گونه حدس غیرمستند یا ادعای امنیت صددرصدی)، یک گزارش فنی به زبان فارسی به صورت JSON تولید کنید:
 ${JSON.stringify(networkData, null, 2)}
 
 قوانین مهم:
-- اگر تست DNS در وضعیت not_configured یا نامشخص است، صریحاً اعلام کنید که بدون Authoritative DNS نمی‌توان عدم نشت DNS را اثبات کرد.
+- اگر تست DNS در وضعیت NOT_CONFIGURED (پیکربندی نشده) یا INCONCLUSIVE (نامشخص) است، صریحاً اعلام کنید که بدون Authoritative DNS نمی‌توان عدم نشت DNS را اثبات کرد.
 - هرگز ادعا نکنید پروتکل تونل VPN (مانند WireGuard یا OpenVPN) از طریق مرورگر اثبات شده است.
 
 فرمت خروجی JSON:
@@ -574,13 +851,21 @@ ${JSON.stringify(networkData, null, 2)}
 }
 `;
 
-    const response = await gemini.models.generateContent({
-      model: 'gemini-3-flash-preview',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-      }
+    // Enforce a strict 4500ms server-side timeout so high-demand 503 retries never cause client net::ERR_ABORTED
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error('GEMINI_TIMEOUT')), 4500);
     });
+
+    const response = await Promise.race([
+      gemini.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: prompt,
+        config: {
+          responseMimeType: 'application/json',
+        },
+      }),
+      timeoutPromise,
+    ]);
 
     const responseText = response.text || '';
     const parsedData = JSON.parse(responseText);
@@ -594,12 +879,15 @@ ${JSON.stringify(networkData, null, 2)}
         generatedAt: new Date().toISOString(),
       }
     });
-  } catch (err: any) {
+  } catch {
+    // Graceful, immediate fallback to deterministic rule-based report on 503 / timeout / quota errors
     return res.status(200).json({
-      success: false,
+      success: true,
       aiAvailable: false,
-      errorCode: 'AI_AUDIT_ERROR',
-      error: `خطا در اجرای تحلیل هوش مصنوعی: ${err?.message || 'Service error'}`
+      audit: buildRuleBasedAuditReport(
+        networkData,
+        'سرویس تحلیل ابری در حال حاضر پاسخگو نبود؛ گزارش زیر مستقیماً بر اساس قواعد قطعی و شواهد واقعی تست‌های اجراشده استخراج شده است.'
+      ),
     });
   }
 });
@@ -616,33 +904,9 @@ async function setupServer() {
     app.use('*', async (req, res, next) => {
       const url = req.originalUrl;
       try {
-        let template = await vite.transformIndexHtml(url, `
-          <!doctype html>
-          <html lang="fa" dir="rtl" class="dark">
-            <head>
-              <meta charset="UTF-8" />
-              <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-              <meta name="theme-color" content="#020617" />
-              <meta name="mobile-web-app-capable" content="yes" />
-              <meta name="apple-mobile-web-app-capable" content="yes" />
-              <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-              <meta name="apple-mobile-web-app-title" content="LeakGuard" />
-              <meta name="application-name" content="LeakGuard" />
-              <meta name="msapplication-TileColor" content="#020617" />
-              <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-              <link rel="icon" type="image/svg+xml" href="/icon.svg" />
-              <title>سامانه تست نشت شبکه و امنیت VPN | LeakGuard Persian</title>
-              <meta name="description" content="ابزار جامع و بومی‌سازی شده سنجش نشت IP، DNS، WebRTC، تحلیل امنیت VPN و عیب‌یابی شبکه به زبان فارسی." />
-              <link rel="preconnect" href="https://fonts.googleapis.com">
-              <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-              <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-            </head>
-            <body class="bg-slate-950 text-slate-100 font-sans antialiased selection:bg-cyan-500 selection:text-slate-950 min-h-screen overscroll-y-none">
-              <div id="root"></div>
-              <script type="module" src="/src/main.tsx"></script>
-            </body>
-          </html>
-        `);
+        const indexPath = path.resolve(process.cwd(), 'index.html');
+        const rawHtml = fs.readFileSync(indexPath, 'utf-8');
+        const template = await vite.transformIndexHtml(url, rawHtml);
         res.status(200).set({ 'Content-Type': 'text/html' }).end(template);
       } catch (e: any) {
         vite.ssrFixStacktrace(e);

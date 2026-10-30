@@ -43,42 +43,42 @@ export function formatStatusBadgeFa(status: TestStatus | undefined, isFa: boolea
   switch (status) {
     case 'PASS':
       return {
-        text: isFa ? 'تأییدشده با شواهد (Pass)' : 'Verified (Pass)',
+        text: isFa ? 'موفق' : 'Pass',
         colorClass: 'text-emerald-400',
       };
     case 'LEAK_DETECTED':
       return {
-        text: isFa ? 'نشت تأیید شد (Leak)' : 'Leak Confirmed',
+        text: isFa ? 'نشت شناسایی شد' : 'Leak Detected',
         colorClass: 'text-rose-400',
       };
     case 'WARNING':
       return {
-        text: isFa ? 'هشدار / احتمال ریسک' : 'Warning',
+        text: isFa ? 'هشدار' : 'Warning',
         colorClass: 'text-amber-400',
       };
     case 'NOT_CONFIGURED':
       return {
-        text: isFa ? 'تنظیم‌نشده (Not Configured)' : 'Not Configured',
+        text: isFa ? 'پیکربندی نشده' : 'Not Configured',
         colorClass: 'text-slate-400',
       };
     case 'INCONCLUSIVE':
       return {
-        text: isFa ? 'نامشخص (شواهد ناکافی)' : 'Inconclusive',
+        text: isFa ? 'نامشخص' : 'Inconclusive',
         colorClass: 'text-amber-300',
       };
     case 'UNSUPPORTED':
       return {
-        text: isFa ? 'پشتیبانی‌نشده (Unsupported)' : 'Unsupported',
+        text: isFa ? 'پشتیبانی نشده' : 'Unsupported',
         colorClass: 'text-slate-400',
       };
     case 'ERROR':
       return {
-        text: isFa ? 'خطا در آزمون (Error)' : 'Error',
+        text: isFa ? 'خطا در آزمون' : 'Error',
         colorClass: 'text-rose-400',
       };
     case 'TESTING':
       return {
-        text: isFa ? 'در حال اندازه‌گیری...' : 'Testing...',
+        text: isFa ? 'در حال آزمایش...' : 'Testing...',
         colorClass: 'text-cyan-400',
       };
     default:

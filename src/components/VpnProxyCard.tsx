@@ -39,7 +39,7 @@ export const VpnProxyCard: React.FC<VpnProxyCardProps> = ({ vpnProxy, lang }) =>
               </p>
             </div>
           </div>
-          <span className={`px-3 py-1 rounded-xl text-xs font-bold bg-slate-950 border border-slate-800 ${statusBadge.colorClass}`}>
+          <span className={`px-3 py-1 rounded-xl text-xs font-bold bg-slate-950 border border-slate-800 shrink-0 whitespace-nowrap ${statusBadge.colorClass}`}>
             {statusBadge.text}
           </span>
         </div>

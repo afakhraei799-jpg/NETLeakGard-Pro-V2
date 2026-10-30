@@ -110,12 +110,31 @@ export interface DnsResolver {
   observationMethod: 'authoritative_dns_log' | 'doh_trace_observation' | 'server_system_resolver';
 }
 
+export interface IndependentBrowserDnsEntry {
+  sourceName: string;
+  observedIp: string;
+  locationOrGeo: string;
+  role: 'edns_recursive_resolver' | 'client_subnet_edns' | 'edge_trace_egress';
+  responseTimeMs: number;
+}
+
+export interface IndependentBrowserDnsObservation {
+  status: TestStatus;
+  entries: IndependentBrowserDnsEntry[];
+  matchesPrimaryEgressIp: boolean | null;
+  summaryFa: string;
+  summaryEn: string;
+  limitationsFa: string[];
+}
+
 export interface DnsLeakResult extends StandardTestMetadata {
   runId: string;
   authoritativeConfigured: boolean;
+  missingEnvVars?: string[];
   detectedResolversCount: number;
   resolvers: DnsResolver[];
   isLeaking: boolean | null;
+  independentBrowserObservation?: IndependentBrowserDnsObservation;
   messageFa: string;
   messageEn: string;
 }
@@ -205,6 +224,37 @@ export interface NetworkMetrics extends StandardTestMetadata {
   testingSpeed: boolean;
 }
 
+export type PortProbeState = 'open' | 'closed' | 'filtered_timeout' | 'not_tested';
+
+export type PortRiskCategory = 'router_admin' | 'remote_access' | 'proxy_relay' | 'file_share';
+
+export interface PortProbeEntry {
+  port: number;
+  protocol: 'TCP';
+  serviceName: string;
+  category: PortRiskCategory;
+  descriptionFa: string;
+  descriptionEn: string;
+  state: PortProbeState;
+  responseTimeMs: number | null;
+  riskLevel: 'critical' | 'high' | 'medium';
+}
+
+export interface PortLeakResult extends StandardTestMetadata {
+  targetIp: string | null;
+  targetSource: 'server_socket' | 'trusted_proxy_header' | 'unverifiable_local_socket';
+  canScanFromServer: boolean;
+  scannedPortsCount: number;
+  openPortsCount: number;
+  closedPortsCount: number;
+  filteredPortsCount: number;
+  openPorts: number[];
+  isExposingSensitivePorts: boolean | null;
+  ports: PortProbeEntry[];
+  messageFa: string;
+  messageEn: string;
+}
+
 export interface AiAuditReport {
   riskScore: number | null;
   statusLevel: 'امن' | 'هشدار' | 'خطر نشت' | 'نامشخص';
@@ -224,6 +274,7 @@ export interface FullNetworkTestReport {
   dnsLeak: DnsLeakResult | null;
   webRtcLeak: WebRtcLeakResult | null;
   vpnProxy: VpnProxyResult | null;
+  portLeak?: PortLeakResult | null;
   metrics: NetworkMetrics | null;
   aiAudit: AiAuditReport | null;
   optimalNodeSuggestion?: OptimalVpnNodeSuggestion;
@@ -232,3 +283,4 @@ export interface FullNetworkTestReport {
   privacyScore: number | null;
   isScoreCalculable: boolean;
 }
+

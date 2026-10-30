@@ -42,7 +42,7 @@ export const IpLeakCard: React.FC<IpLeakCardProps> = ({ ipDetails, lang }) => {
               </p>
             </div>
           </div>
-          <span className={`font-mono text-xs font-bold bg-slate-950 border border-slate-800 px-3 py-1 rounded-xl ${statusBadge.colorClass}`}>
+          <span className={`font-mono text-xs font-bold bg-slate-950 border border-slate-800 px-3 py-1 rounded-xl shrink-0 whitespace-nowrap ${statusBadge.colorClass}`}>
             {statusBadge.text}
           </span>
         </div>
@@ -151,7 +151,7 @@ export const IpLeakCard: React.FC<IpLeakCardProps> = ({ ipDetails, lang }) => {
               <span className="font-mono text-slate-300">
                 {ipDetails?.blacklistDetails.abuseIpDbStatus === 'not_configured'
                   ? isFa
-                    ? 'تنظیم‌نشده (not_configured)'
+                    ? 'پیکربندی نشده (not_configured)'
                     : 'not_configured'
                   : ipDetails?.blacklistDetails.abuseIpDbStatus || '---'}
               </span>
@@ -159,7 +159,7 @@ export const IpLeakCard: React.FC<IpLeakCardProps> = ({ ipDetails, lang }) => {
             <div className="flex items-center justify-between">
               <span>Google Safe Browsing / Spamhaus:</span>
               <span className="font-mono text-slate-400">
-                {isFa ? 'تنظیم‌نشده (عدم ادعای پاک بودن بدون کلید API)' : 'not_configured'}
+                {isFa ? 'پیکربندی نشده (عدم ادعای پاک بودن بدون کلید API)' : 'not_configured'}
               </span>
             </div>
           </div>

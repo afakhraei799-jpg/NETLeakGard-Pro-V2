@@ -297,11 +297,14 @@ export const Globe3D: React.FC<Globe3DProps> = ({ ipDetails, lang, overallStatus
 
     let animationFrameId: number | null = null;
     let timeoutId: ReturnType<typeof setTimeout> | null = null;
-    const clock = new THREE.Clock();
+    const startTimeMs = performance.now();
+    let prevTimeMs = startTimeMs;
 
     function renderFrame() {
-      const delta = clock.getDelta();
-      const time = clock.getElapsedTime();
+      const nowMs = performance.now();
+      const delta = Math.min(0.1, (nowMs - prevTimeMs) / 1000);
+      prevTimeMs = nowMs;
+      const time = (nowMs - startTimeMs) / 1000;
       controls.update();
 
       mainGroup.rotation.y += delta * (isLeak ? 0.4 : 0.18);
