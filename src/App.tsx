@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Language,
   TestStatus,
@@ -58,6 +58,9 @@ export default function App() {
   const [isTesting, setIsTesting] = useState<boolean>(false);
   const [autoRun, setAutoRun] = useState<boolean>(true);
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
+
+  const runSequenceRef = useRef<number>(0);
+  const activeAbortControllerRef = useRef<AbortController | null>(null);
 
   const isOnline = useOnlineStatus();
 
@@ -186,29 +189,53 @@ export default function App() {
     }
   }, [soundEnabled]);
 
-  // Main Test Execution Flow
+  // Main Test Execution Flow with race condition prevention & AbortController support
   const runFullLeakSuite = useCallback(async () => {
+    if (activeAbortControllerRef.current) {
+      activeAbortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    activeAbortControllerRef.current = controller;
+    const currentRunSeq = ++runSequenceRef.current;
+
+    const isStale = () => currentRunSeq !== runSequenceRef.current || controller.signal.aborted;
+
     setIsTesting(true);
     setOverallStatus('TESTING');
+    setPrivacyScore(null);
+    setIsScoreCalculable(false);
+    setScoreReasonsFa([]);
+    setIpDetails(null);
+    setDnsLeak(null);
+    setWebRtcLeak(null);
+    setVpnProxy(null);
+    setPortLeak(null);
+    setMetrics(null);
+    setAiAudit(null);
 
     try {
-      const ipData = await fetchIpDetails();
+      const ipData = await fetchIpDetails(controller.signal);
+      if (isStale()) return;
       setIpDetails(ipData);
 
-      const dnsRes = await performDnsLeakTest(ipData);
+      const dnsRes = await performDnsLeakTest(ipData, controller.signal);
+      if (isStale()) return;
       setDnsLeak(dnsRes);
 
       const [webRtcRes, portRes] = await Promise.all([
-        performWebRtcLeakTest(ipData.ip),
-        performPortLeakTest(),
+        performWebRtcLeakTest(ipData, controller.signal),
+        performPortLeakTest(controller.signal),
       ]);
+      if (isStale()) return;
       setWebRtcLeak(webRtcRes);
       setPortLeak(portRes);
 
       const vpnRes = performVpnAnalysis(ipData, dnsRes);
+      if (isStale()) return;
       setVpnProxy(vpnRes);
 
-      const speedRes = await measurePingAndSpeed();
+      const speedRes = await measurePingAndSpeed(controller.signal);
+      if (isStale()) return;
       setMetrics(speedRes);
 
       // Strictly evidence-based overall evaluation (no fake 100 score when DNS/WebRTC is unconfigured or inconclusive!)
@@ -220,6 +247,7 @@ export default function App() {
         portLeak: portRes,
       });
 
+      if (isStale()) return;
       setOverallStatus(summary.overallStatus);
       setPrivacyScore(summary.privacyScore);
       setIsScoreCalculable(summary.isScoreCalculable);
@@ -244,26 +272,30 @@ export default function App() {
       }
 
       // Gemini AI Audit Synthesis
-      const auditRes = await fetchAiAudit({
-        ip: ipData.ip,
-        ipDetails: ipData,
-        countryName: ipData.countryName,
-        city: ipData.city,
-        isp: ipData.isp,
-        asn: ipData.asn,
-        isVpnOrProxyDetected: ipData.isVpnOrProxyDetected,
-        dnsLeakStatus: dnsRes.status,
-        dnsServerCount: dnsRes.detectedResolversCount,
-        webRtcLeakStatus: webRtcRes.status,
-        portLeakStatus: portRes.status,
-        localWebRtcIp: webRtcRes.localIps[0] || (webRtcRes.mdnsHosts[0] ?? 'مشاهده نشد'),
-        pingMs: speedRes.pingMs,
-        fraudRiskScore: ipData.fraudRiskScore,
-        fraudStatusFa: ipData.fraudStatusFa,
-        usageTypeFa: ipData.usageTypeFa,
-        userIntentAnalysisFa: ipData.userIntentAnalysisFa,
-      });
+      const auditRes = await fetchAiAudit(
+        {
+          ip: ipData.ip,
+          ipDetails: ipData,
+          countryName: ipData.countryName,
+          city: ipData.city,
+          isp: ipData.isp,
+          asn: ipData.asn,
+          isVpnOrProxyDetected: ipData.isVpnOrProxyDetected,
+          dnsLeakStatus: dnsRes.status,
+          dnsServerCount: dnsRes.detectedResolversCount,
+          webRtcLeakStatus: webRtcRes.status,
+          portLeakStatus: portRes.status,
+          localWebRtcIp: webRtcRes.localIps[0] || (webRtcRes.mdnsHosts[0] ?? 'مشاهده نشد'),
+          pingMs: speedRes.pingMs,
+          fraudRiskScore: ipData.fraudRiskScore,
+          fraudStatusFa: ipData.fraudStatusFa,
+          usageTypeFa: ipData.usageTypeFa,
+          userIntentAnalysisFa: ipData.userIntentAnalysisFa,
+        },
+        controller.signal
+      );
 
+      if (isStale()) return;
       setAiAudit(auditRes);
 
       if (summary.overallStatus === 'LEAK_DETECTED') {
@@ -272,11 +304,15 @@ export default function App() {
         playSuccessSound();
       }
     } catch {
+      if (isStale()) return;
       setOverallStatus('ERROR');
       setPrivacyScore(null);
       setIsScoreCalculable(false);
     } finally {
-      setIsTesting(false);
+      if (currentRunSeq === runSequenceRef.current) {
+        setIsTesting(false);
+        activeAbortControllerRef.current = null;
+      }
     }
   }, [playLeakAlarmSound, playSuccessSound]);
 
@@ -301,15 +337,20 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isTesting, runFullLeakSuite]);
 
-  // Initial Auto-run on boot
+  // Initial Auto-run on boot + abort cleanup on unmount
   useEffect(() => {
     if (autoRun) {
       runFullLeakSuite();
     }
+    return () => {
+      activeAbortControllerRef.current?.abort();
+    };
   }, []);
 
   const handleRetestPorts = useCallback(async () => {
-    const res = await performPortLeakTest();
+    const seqAtStart = runSequenceRef.current;
+    const res = await performPortLeakTest(activeAbortControllerRef.current?.signal);
+    if (seqAtStart !== runSequenceRef.current) return;
     setPortLeak(res);
     if (ipDetails) {
       const summary = evaluateOverallSummary({

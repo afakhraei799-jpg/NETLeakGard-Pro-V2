@@ -77,6 +77,7 @@ export function formatStatusBadgeFa(status: TestStatus | undefined, isFa: boolea
         colorClass: 'text-rose-400',
       };
     case 'TESTING':
+    case 'RUNNING':
       return {
         text: isFa ? 'در حال آزمایش...' : 'Testing...',
         colorClass: 'text-cyan-400',
@@ -139,8 +140,8 @@ export const HeroScoreBanner: React.FC<HeroScoreBannerProps> = ({
           label: isFa ? 'خطا در اجرای تست‌های پایه' : 'Test Execution Error',
           color: 'text-rose-400 bg-rose-950/60 border-rose-800',
           desc: isFa
-            ? 'یک یا چند آزمون به علت خطای شبکه یا عدم پاسخ سرویس کامل نشدند.'
-            : 'One or more core tests failed due to network or API errors.',
+            ? 'خطا در اجرای تست؛ نتیجه قابل تأیید نیست.'
+            : 'Test execution failed; result cannot be verified.',
           strokeColor: '#ef4444',
         };
       case 'INCONCLUSIVE':
@@ -155,6 +156,7 @@ export const HeroScoreBanner: React.FC<HeroScoreBannerProps> = ({
           strokeColor: '#eab308',
         };
       case 'TESTING':
+      case 'RUNNING':
         return {
           icon: Activity,
           label: t.statusTesting,

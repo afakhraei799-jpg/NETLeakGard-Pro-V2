@@ -27,10 +27,21 @@ function formatTestStatusFa(status: TestStatus | undefined): string {
     case 'UNSUPPORTED':
       return 'عدم پشتیبانی (UNSUPPORTED)';
     case 'ERROR':
-      return 'خطا در اجرای تست (ERROR)';
+      return 'خطا در اجرای تست؛ نتیجه قابل تأیید نیست (ERROR)';
+    case 'TESTING':
+    case 'RUNNING':
+      return 'در حال آزمایش (RUNNING)';
     default:
       return 'نامشخص';
   }
+}
+
+function sanitizeCsvCell(value: unknown): string {
+  const str = String(value ?? '').replace(/"/g, '""');
+  if (/^[=+\-@\t\r]/.test(str)) {
+    return `"'${str}"`;
+  }
+  return `"${str}"`;
 }
 
 export const ExportModal: React.FC<ExportModalProps> = ({ isOpen, onClose, report, lang }) => {
@@ -77,7 +88,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({ isOpen, onClose, repor
       ['امتیاز کلی امنیت / Privacy Score', scoreLabel],
     ];
 
-    const csvContent = 'data:text/csv;charset=utf-8,\uFEFF' + rows.map(e => e.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(',')).join('\n');
+    const csvContent = 'data:text/csv;charset=utf-8,\uFEFF' + rows.map(e => e.map(sanitizeCsvCell).join(',')).join('\n');
     const encodedUri = encodeURI(csvContent);
     const link = document.createElement('a');
     link.setAttribute('href', encodedUri);

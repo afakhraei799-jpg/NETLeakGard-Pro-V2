@@ -28,12 +28,12 @@ function formatPortStateBadge(state: PortProbeState, isFa: boolean): {
   switch (state) {
     case 'open':
       return {
-        label: isFa ? 'باز (خطر نشت)' : 'OPEN',
+        label: isFa ? 'پورت باز (پاسخ TCP)' : 'OPEN (TCP)',
         badgeClass: 'bg-rose-950/80 border-rose-700/80 text-rose-300',
       };
     case 'closed':
       return {
-        label: isFa ? 'بسته (امن)' : 'CLOSED',
+        label: isFa ? 'بسته (Closed)' : 'CLOSED',
         badgeClass: 'bg-emerald-950/70 border-emerald-700/70 text-emerald-300',
       };
     case 'filtered_timeout':
@@ -83,8 +83,8 @@ export const PortLeakCard: React.FC<PortLeakCardProps> = ({
                 <h3 className="text-base font-extrabold text-white">{t.portLeakTitle}</h3>
                 <p className="text-[11px] text-slate-400">
                   {isFa
-                    ? 'بررسی پورت‌های مدیریت مودم/روتر (۸۰، ۴۴۳، ۸۰۸۰، ۸۲۹۱، ۲۲، ۲۳، ۱۰۸۰)'
-                    : 'Router WAN Admin & Proxy Port Exposure Probe'}
+                    ? 'بررسی هندشیک TCP روی پورت‌های متداول (۸۰، ۴۴۳، ۸۰۸۰، ۸۲۹۱، ۲۲، ۲۳، ۲۱، ۱۰۸۰)'
+                    : 'Public Egress TCP Handshake Probe on Common Service Ports'}
                 </p>
               </div>
             </div>

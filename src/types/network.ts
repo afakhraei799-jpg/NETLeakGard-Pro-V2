@@ -13,6 +13,7 @@ export type Language = 'fa' | 'en';
  */
 export type TestStatus =
   | 'IDLE'
+  | 'RUNNING'
   | 'TESTING'
   | 'PASS'
   | 'WARNING'
@@ -58,6 +59,7 @@ export interface ObservedIpSource {
   version: 'IPv4' | 'IPv6';
   observedFrom: 'client_direct' | 'server_socket' | 'server_trusted_header';
   responseTimeMs: number;
+  observedAt?: string;
 }
 
 export interface IpDetails extends StandardTestMetadata {
@@ -104,6 +106,10 @@ export interface DnsResolver {
   asn?: string;
   isp?: string;
   location: string;
+  countryCode?: string;
+  runId?: string;
+  queryName?: string;
+  observedAt?: string;
   status: string;
   responseTimeMs: number | null;
   isEncryptedDoH: boolean | null;

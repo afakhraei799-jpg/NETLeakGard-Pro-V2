@@ -24,8 +24,61 @@ import {
   evaluateIndependentBrowserDnsObservation,
   evaluateVpnHeuristic,
   calculateHttpPingMetrics,
-  evaluatePortLeakResult
+  evaluatePortLeakResult,
+  evaluateObservedIpSources
 } from '../utils/networkEvaluator';
+
+/**
+ * Creates an AbortSignal that aborts either when the internal timeout expires OR when the caller's signal aborts.
+ * Ensures caller cancellations (e.g. re-running test) abort in-flight fetch requests immediately.
+ */
+export function createTimeoutAndAbortSignal(
+  timeoutMs: number,
+  callerSignal?: AbortSignal
+): { signal: AbortSignal; cleanup: () => void } {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(new DOMException('Request timeout', 'TimeoutError'));
+  }, timeoutMs);
+
+  const onCallerAbort = () => {
+    clearTimeout(timer);
+    controller.abort(callerSignal?.reason);
+  };
+
+  if (callerSignal) {
+    if (callerSignal.aborted) {
+      clearTimeout(timer);
+      controller.abort(callerSignal.reason);
+    } else {
+      callerSignal.addEventListener('abort', onCallerAbort, { once: true });
+    }
+  }
+
+  const cleanup = () => {
+    clearTimeout(timer);
+    if (callerSignal) {
+      callerSignal.removeEventListener('abort', onCallerAbort);
+    }
+  };
+
+  return { signal: controller.signal, cleanup };
+}
+
+/**
+ * Combines an internal timeout with an optional caller AbortSignal so both user cancellation
+ * and per-request timeouts abort in-flight network requests cleanly.
+ */
+export function createBoundedSignal(timeoutMs: number, externalSignal?: AbortSignal): AbortSignal {
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  if (!externalSignal) {
+    return timeoutSignal;
+  }
+  if (typeof AbortSignal.any === 'function') {
+    return AbortSignal.any([externalSignal, timeoutSignal]);
+  }
+  return createTimeoutAndAbortSignal(timeoutMs, externalSignal).signal;
+}
 
 function generateCryptoRunId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -132,7 +185,7 @@ export function generateOptimalVpnNodeSuggestion(
  * 1. Fetch & Cross-Verify Client-Observed Public IP vs Server-Observed IP
  * Never returns hardcoded fallback IPs ('185.190.140.1') or fake Clean blacklist badges.
  */
-export async function fetchIpDetails(): Promise<IpDetails> {
+export async function fetchIpDetails(signal?: AbortSignal): Promise<IpDetails> {
   const startedAt = new Date().toISOString();
   const ipSources: ObservedIpSource[] = [];
   const observations: string[] = [];
@@ -142,7 +195,7 @@ export async function fetchIpDetails(): Promise<IpDetails> {
     const t0 = performance.now();
     const res1 = await fetch('https://api64.ipify.org?format=json', {
       cache: 'no-store',
-      signal: AbortSignal.timeout(4000),
+      signal: createBoundedSignal(4000, signal),
     });
     if (res1.ok) {
       const j1 = await res1.json();
@@ -153,11 +206,14 @@ export async function fetchIpDetails(): Promise<IpDetails> {
           version: isValidIpv6(j1.ip) ? 'IPv6' : 'IPv4',
           observedFrom: 'client_direct',
           responseTimeMs: Math.round(performance.now() - t0),
+          observedAt: new Date().toISOString(),
         });
       }
+    } else {
+      observations.push(`سرویس api64.ipify.org وضعیت HTTP ${res1.status} برگرداند.`);
     }
-  } catch {
-    // Recorded in observations below if needed
+  } catch (err: any) {
+    observations.push(`عدم دریافت پاسخ از api64.ipify.org: ${err?.message || 'Timeout/Blocked'}`);
   }
 
   // Step 1B: Probe Client-Direct Public IP from independent HTTPS service #2 (ipwho.is)
@@ -166,7 +222,7 @@ export async function fetchIpDetails(): Promise<IpDetails> {
     const t1 = performance.now();
     const res2 = await fetch('https://ipwho.is/', {
       cache: 'no-store',
-      signal: AbortSignal.timeout(4000),
+      signal: createBoundedSignal(4000, signal),
     });
     if (res2.ok) {
       const j2 = await res2.json();
@@ -178,11 +234,14 @@ export async function fetchIpDetails(): Promise<IpDetails> {
           version: isValidIpv6(j2.ip) ? 'IPv6' : 'IPv4',
           observedFrom: 'client_direct',
           responseTimeMs: Math.round(performance.now() - t1),
+          observedAt: new Date().toISOString(),
         });
       }
+    } else {
+      observations.push(`سرویس ipwho.is (مستقیم مرورگر) وضعیت HTTP ${res2.status} برگرداند.`);
     }
-  } catch {
-    // Continue to server check
+  } catch (err: any) {
+    observations.push(`عدم دریافت پاسخ از ipwho.is (مستقیم مرورگر): ${err?.message || 'Timeout/Blocked'}`);
   }
 
   const clientObservedIp = ipSources.length > 0 ? ipSources[0].ip : null;
@@ -193,7 +252,7 @@ export async function fetchIpDetails(): Promise<IpDetails> {
     const tServer = performance.now();
     const serverRes = await fetch(`/api/ip-info${query}`, {
       cache: 'no-store',
-      signal: AbortSignal.timeout(6000),
+      signal: createBoundedSignal(6000, signal),
     });
 
     if (serverRes.ok) {
@@ -210,14 +269,13 @@ export async function fetchIpDetails(): Promise<IpDetails> {
             version: isValidIpv6(srvData.serverObservedIp) ? 'IPv6' : 'IPv4',
             observedFrom: srvData.proxyHeaderTrusted ? 'server_trusted_header' : 'server_socket',
             responseTimeMs: Math.round(performance.now() - tServer),
+            observedAt: new Date().toISOString(),
           });
         }
 
-        // Compare all public IPs observed across independent client & server sources
-        const uniquePublicIps = Array.from(
-          new Set(ipSources.map(s => s.ip).filter(ip => !isPrivateOrLocalAddress(ip)))
-        );
-        const ipMismatchDetected = uniquePublicIps.length > 1;
+        // Compare public IPs within the same address family (IPv4 vs IPv4, IPv6 vs IPv6)
+        const sourceEval = evaluateObservedIpSources(ipSources);
+        const { uniquePublicIps, uniqueIpv4s, uniqueIpv6s, ipMismatchDetected, isDualStackObserved } = sourceEval;
 
         if (clientObservedIp) {
           observations.push(`آدرس IP مشاهده‌شده مستقیم از مرورگر کلاینت: ${clientObservedIp}`);
@@ -229,9 +287,14 @@ export async function fetchIpDetails(): Promise<IpDetails> {
             })`
           );
         }
+        if (isDualStackObserved && !ipMismatchDetected) {
+          observations.push(
+            `اتصال دوپشته (Dual-Stack IPv4/IPv6) مشاهده شد: IPv4 (${uniqueIpv4s.join(', ')}) و IPv6 (${uniqueIpv6s.join(', ')}). تفاوت خانوادهٔ آدرس به‌تنهایی نشت تلقی نمی‌شود.`
+          );
+        }
         if (ipMismatchDetected) {
           observations.push(
-            `هشدار مغایرت مسیر IP: منابع مستقل آدرس‌های متفاوتی (${uniquePublicIps.join(' ≠ ')}) گزارش کردند (احتمال Split-Tunneling یا پروکسی بخشی از ترافیک).`
+            `هشدار مغایرت مسیر IP در یک خانوادهٔ آدرس: منابع مستقل آدرس‌های متفاوتی (${uniquePublicIps.join(' ≠ ')}) گزارش کردند (احتمال Split-Tunneling یا پروکسی بخشی از ترافیک).`
           );
         }
 
@@ -246,6 +309,9 @@ export async function fetchIpDetails(): Promise<IpDetails> {
             ...(srvData.evidence || {}),
             clientDirectSources: ipSources,
             uniquePublicIps,
+            uniqueIpv4s,
+            uniqueIpv6s,
+            isDualStackObserved,
             ipMismatchDetected,
           },
         };
@@ -258,8 +324,8 @@ export async function fetchIpDetails(): Promise<IpDetails> {
   // If server failed, but client-direct GeoIP succeeded, build honest result from client-direct observation
   if (clientObservedIp) {
     const completedAt = new Date().toISOString();
-    const uniquePublicIps = Array.from(new Set(ipSources.map(s => s.ip)));
-    const ipMismatchDetected = uniquePublicIps.length > 1;
+    const sourceEval = evaluateObservedIpSources(ipSources);
+    const { uniquePublicIps, uniqueIpv4s, uniqueIpv6s, ipMismatchDetected, isDualStackObserved } = sourceEval;
 
     return {
       status: ipMismatchDetected ? 'LEAK_DETECTED' : 'PASS',
@@ -267,12 +333,16 @@ export async function fetchIpDetails(): Promise<IpDetails> {
       startedAt,
       completedAt,
       observations: [
+        ...observations,
         `آدرس IP از طریق استعلام مستقیم مرورگر دریافت شد: ${clientObservedIp}`,
         'سرور برنامه پاسخ معتبری برنگرداند؛ مقایسهٔ سرور و کلاینت انجام نشد.',
       ],
       evidence: {
         clientDirectSources: ipSources,
         uniquePublicIps,
+        uniqueIpv4s,
+        uniqueIpv6s,
+        isDualStackObserved,
       },
       limitations: [
         'موقعیت جغرافیایی صرفاً تخمین پایگاه دادهٔ GeoIP است و مکان دقیق دستگاه نیست.',
@@ -395,7 +465,8 @@ export async function fetchIpDetails(): Promise<IpDetails> {
  * Never fabricates any resolver on failure, and is strictly separated from Authoritative DNS Leak testing.
  */
 async function probeIndependentBrowserDnsObservation(
-  ipDetails: IpDetails | null
+  ipDetails: IpDetails | null,
+  signal?: AbortSignal
 ): Promise<IndependentBrowserDnsObservation> {
   const entries: IndependentBrowserDnsEntry[] = [];
 
@@ -404,7 +475,7 @@ async function probeIndependentBrowserDnsObservation(
       const t0 = performance.now();
       const resp = await fetch(`https://edns.ip-api.com/json?nocache=${Date.now()}`, {
         cache: 'no-store',
-        signal: AbortSignal.timeout(4000),
+        signal: createBoundedSignal(4000, signal),
       });
       if (!resp.ok) return;
       const data = await resp.json();
@@ -432,7 +503,7 @@ async function probeIndependentBrowserDnsObservation(
       const t0 = performance.now();
       const resp = await fetch('https://1.1.1.1/cdn-cgi/trace', {
         cache: 'no-store',
-        signal: AbortSignal.timeout(3500),
+        signal: createBoundedSignal(3500, signal),
       });
       if (!resp.ok) return;
       const text = await resp.text();
@@ -461,19 +532,22 @@ async function probeIndependentBrowserDnsObservation(
 
 /**
  * 2. Perform Authoritative DNS Leak Test + Independent Zero-Cost Browser DNS Comparison
- * Uses unique cryptographic per-run token. Never returns fake resolvers or random latencies.
+ * Uses unique cryptographic per-run token and bounded collector polling. Never returns fake resolvers or random latencies.
  */
-export async function performDnsLeakTest(ipDetails: IpDetails | null): Promise<DnsLeakResult> {
+export async function performDnsLeakTest(
+  ipDetails: IpDetails | null,
+  signal?: AbortSignal
+): Promise<DnsLeakResult> {
   const startedAt = new Date().toISOString();
   const runId = generateCryptoRunId();
 
-  const independentPromise = probeIndependentBrowserDnsObservation(ipDetails);
+  const independentPromise = probeIndependentBrowserDnsObservation(ipDetails, signal);
 
   try {
     const [res, independentBrowserObservation] = await Promise.all([
       fetch(`/api/dns-leak-probe?runId=${encodeURIComponent(runId)}`, {
         cache: 'no-store',
-        signal: AbortSignal.timeout(6000),
+        signal: createBoundedSignal(6000, signal),
       }),
       independentPromise,
     ]);
@@ -505,28 +579,41 @@ export async function performDnsLeakTest(ipDetails: IpDetails | null): Promise<D
       );
       await Promise.allSettled(
         probeUrls.map(u =>
-          fetch(u, { mode: 'no-cors', cache: 'no-store', signal: AbortSignal.timeout(2500) })
+          fetch(u, { mode: 'no-cors', cache: 'no-store', signal: createBoundedSignal(2500, signal) })
         )
       );
 
-      // Re-fetch captured authoritative DNS logs for this runId
-      const collectRes = await fetch(`/api/dns-leak-probe?runId=${encodeURIComponent(runId)}`, {
-        cache: 'no-store',
-        signal: AbortSignal.timeout(5000),
-      });
-      if (collectRes.ok) {
-        const collectJson = await collectRes.json();
-        return evaluateDnsTestResult({
-          runId,
-          authoritativeConfigured: true,
-          missingEnvVars: [],
-          resolvers: Array.isArray(collectJson.resolvers) ? collectJson.resolvers : [],
-          ipDetails,
-          independentBrowserObservation,
-          startedAt,
-          completedAt: new Date().toISOString(),
+      // Bounded polling (up to 3 attempts, 400ms apart) so asynchronous DNS log ingestion completes without unbounded waiting
+      let capturedResolvers: any[] = [];
+      const maxPollAttempts = 3;
+      for (let attempt = 0; attempt < maxPollAttempts; attempt++) {
+        if (signal?.aborted) break;
+        if (attempt > 0) {
+          await new Promise(r => setTimeout(r, 400));
+        }
+        const collectRes = await fetch(`/api/dns-leak-probe?runId=${encodeURIComponent(runId)}`, {
+          cache: 'no-store',
+          signal: createBoundedSignal(4500, signal),
         });
+        if (collectRes.ok) {
+          const collectJson = await collectRes.json();
+          if (Array.isArray(collectJson.resolvers) && collectJson.resolvers.length > 0) {
+            capturedResolvers = collectJson.resolvers;
+            break;
+          }
+        }
       }
+
+      return evaluateDnsTestResult({
+        runId,
+        authoritativeConfigured: true,
+        missingEnvVars: [],
+        resolvers: capturedResolvers,
+        ipDetails,
+        independentBrowserObservation,
+        startedAt,
+        completedAt: new Date().toISOString(),
+      });
     }
 
     return evaluateDnsTestResult({
@@ -561,7 +648,8 @@ export async function performDnsLeakTest(ipDetails: IpDetails | null): Promise<D
  * Never injects fake local IPs ('192.168.1.105') and never reports PASS when 0 STUN candidates are gathered.
  */
 export async function performWebRtcLeakTest(
-  referenceIpOrDetails: string | IpDetails | null
+  referenceIpOrDetails: string | IpDetails | null,
+  signal?: AbortSignal
 ): Promise<WebRtcLeakResult> {
   const startedAt = new Date().toISOString();
   const stunServersUsed = [
@@ -577,6 +665,11 @@ export async function performWebRtcLeakTest(
     if (referenceIpOrDetails.ip) referencePublicIps.push(referenceIpOrDetails.ip);
     if (referenceIpOrDetails.clientObservedIp) referencePublicIps.push(referenceIpOrDetails.clientObservedIp);
     if (referenceIpOrDetails.serverObservedIp) referencePublicIps.push(referenceIpOrDetails.serverObservedIp);
+    if (Array.isArray(referenceIpOrDetails.ipSources)) {
+      for (const src of referenceIpOrDetails.ipSources) {
+        if (src?.ip) referencePublicIps.push(src.ip);
+      }
+    }
   }
 
   return new Promise(resolve => {
@@ -589,6 +682,21 @@ export async function performWebRtcLeakTest(
           stunServersUsed,
           startedAt,
           completedAt: new Date().toISOString(),
+        })
+      );
+      return;
+    }
+
+    if (signal?.aborted) {
+      resolve(
+        evaluateWebRtcCandidates({
+          isSupported: true,
+          candidates: [],
+          referencePublicIps,
+          stunServersUsed,
+          startedAt,
+          completedAt: new Date().toISOString(),
+          errorMessage: 'WebRTC test aborted',
         })
       );
       return;
@@ -618,12 +726,21 @@ export async function performWebRtcLeakTest(
       return;
     }
 
+    const onExternalAbort = () => {
+      finishTest('WebRTC test aborted');
+    };
+
     const finishTest = (errorMessage?: string) => {
       if (finished) return;
       finished = true;
       clearTimeout(timeoutId);
+      signal?.removeEventListener('abort', onExternalAbort);
       try {
-        pc?.close();
+        if (pc) {
+          pc.onicecandidate = null;
+          pc.onicecandidateerror = null;
+          pc.close();
+        }
       } catch {
         // Ignore close error
       }
@@ -641,6 +758,8 @@ export async function performWebRtcLeakTest(
         })
       );
     };
+
+    signal?.addEventListener('abort', onExternalAbort, { once: true });
 
     const timeoutId = setTimeout(() => {
       finishTest();
@@ -697,7 +816,7 @@ export async function performPortLeakTest(signal?: AbortSignal): Promise<PortLea
   try {
     const resp = await fetch(`/api/port-scan?t=${Date.now()}`, {
       cache: 'no-store',
-      signal: signal || AbortSignal.timeout(7500),
+      signal: createBoundedSignal(7500, signal),
     });
 
     if (!resp.ok) {
@@ -757,7 +876,7 @@ export async function measurePingAndSpeed(signal?: AbortSignal): Promise<Network
     try {
       const resp = await fetch(`/api/ping?seq=${i}&t=${Date.now()}`, {
         cache: 'no-store',
-        signal: signal || AbortSignal.timeout(3000),
+        signal: createBoundedSignal(3000, signal),
       });
       if (resp.ok) {
         const rtt = Math.round((performance.now() - t0) * 10) / 10;
@@ -781,7 +900,7 @@ export async function measurePingAndSpeed(signal?: AbortSignal): Promise<Network
       const dlStart = performance.now();
       const speedResp = await fetch(`/api/speed-test/chunk?bytes=${chunkBytes}&t=${Date.now()}`, {
         cache: 'no-store',
-        signal: signal || AbortSignal.timeout(8000),
+        signal: createBoundedSignal(8000, signal),
       });
       if (speedResp.ok) {
         const buf = await speedResp.arrayBuffer();
@@ -815,7 +934,7 @@ export async function measurePingAndSpeed(signal?: AbortSignal): Promise<Network
 /**
  * 6. Gemini AI Security Audit Query (Strictly grounded in real observations)
  */
-export async function fetchAiAudit(networkData: any): Promise<AiAuditReport> {
+export async function fetchAiAudit(networkData: any, signal?: AbortSignal): Promise<AiAuditReport> {
   const nodeSuggestion = generateOptimalVpnNodeSuggestion(
     networkData?.ipDetails || null,
     networkData?.pingMs ?? null
@@ -827,7 +946,7 @@ export async function fetchAiAudit(networkData: any): Promise<AiAuditReport> {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ networkData }),
-      signal: AbortSignal.timeout(9000),
+      signal: createBoundedSignal(9000, signal),
     });
     if (res.ok) {
       const json = await res.json();

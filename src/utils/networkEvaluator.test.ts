@@ -1,10 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  COMMON_SENSITIVE_PORTS,
+  canonicalizeIp,
   isValidIpv4,
   isValidIpv6,
   isPrivateOrLocalAddress,
   isGloballyRoutablePublicIp,
+  isSafeExternalUrl,
   formatTestStatusLabelFa,
   isValidGeoCoordinate,
   resolveGlobeVisualStatus,
@@ -15,14 +18,18 @@ import {
   evaluateVpnHeuristic,
   calculateHttpPingMetrics,
   evaluatePortLeakResult,
-  evaluateOverallSummary
+  evaluateOverallSummary,
+  evaluateObservedIpSources,
+  validateAiAuditPayload
 } from './networkEvaluator';
+import { createBoundedSignal } from '../services/networkTester';
 import * as THREE from 'three';
 import {
   latLonToVector3,
   createGlobeResourceManager,
   initGlobeWebGLSafe,
 } from '../components/Globe3D';
+import cloudflareWorker, { type Env as CloudflareEnv } from '../../cloudflare/worker';
 
 test('IP validation and RFC1918/mDNS private address classification', () => {
   assert.equal(isValidIpv4('1.1.1.1'), true);
@@ -225,8 +232,11 @@ test('evaluateVpnHeuristic reports probabilistic ASN classification and never fa
   };
 
   const vpnRes = evaluateVpnHeuristic(datacenterIp, dnsPass);
-  assert.equal(vpnRes.status, 'PASS');
+  // Datacenter IP classification is separated from tunnel leak status:
+  // isDatacenterIp is true (probabilistic ASN classification), while browser tunnel verification status is INCONCLUSIVE (never automatic PASS)
+  assert.equal(vpnRes.status, 'INCONCLUSIVE');
   assert.equal(vpnRes.isDatacenterIp, true);
+  assert.equal(vpnRes.isKnownProxy, null);
   assert.equal(vpnRes.confidence, 'medium');
   assert.equal(vpnRes.protocolDetails.isProvableFromBrowser, false);
   assert.equal(vpnRes.protocolDetails.code, 'unknown_protocol');
@@ -368,7 +378,10 @@ test('evaluateIndependentBrowserDnsObservation stays strictly separate from Auth
 
   const emptyObs = evaluateIndependentBrowserDnsObservation([], mockIpDetails);
   assert.equal(emptyObs.status, 'INCONCLUSIVE');
+  assert.equal(emptyObs.matchesPrimaryEgressIp, null);
 
+  // Observing a single recursive resolver in the browser does not prove absence of DNS leak (status: INCONCLUSIVE)
+  // and does not compare a resolver IP as an egress IP (matchesPrimaryEgressIp: null)
   const validBrowserObs = evaluateIndependentBrowserDnsObservation(
     [
       {
@@ -381,9 +394,10 @@ test('evaluateIndependentBrowserDnsObservation stays strictly separate from Auth
     ],
     mockIpDetails
   );
-  assert.equal(validBrowserObs.status, 'PASS');
+  assert.equal(validBrowserObs.status, 'INCONCLUSIVE');
+  assert.equal(validBrowserObs.matchesPrimaryEgressIp, null);
 
-  // Even when independent browser observation succeeds, Authoritative DNS without env vars MUST remain NOT_CONFIGURED
+  // Even when independent browser observation is present, Authoritative DNS without env vars MUST remain NOT_CONFIGURED
   const dnsResult = evaluateDnsTestResult({
     runId: 'token-abc',
     authoritativeConfigured: false,
@@ -396,7 +410,7 @@ test('evaluateIndependentBrowserDnsObservation stays strictly separate from Auth
   });
   assert.equal(dnsResult.status, 'NOT_CONFIGURED');
   assert.equal(dnsResult.isLeaking, null);
-  assert.equal(dnsResult.independentBrowserObservation?.status, 'PASS');
+  assert.equal(dnsResult.independentBrowserObservation?.status, 'INCONCLUSIVE');
   assert.deepEqual(dnsResult.missingEnvVars, [
     'DNS_LEAK_DOMAIN',
     'DNS_COLLECTOR_API_URL',
@@ -419,7 +433,7 @@ test('evaluatePortLeakResult accurately classifies local unverifiable sockets, o
   assert.equal(localRes.status, 'INCONCLUSIVE');
   assert.equal(localRes.isExposingSensitivePorts, null);
 
-  // 2. Public IP with open router port 8291 -> LEAK_DETECTED
+  // 2. Public IP with critical open port 8291 -> LEAK_DETECTED
   const openPortRes = evaluatePortLeakResult({
     targetIp: '203.0.113.55',
     targetSource: 'server_socket',
@@ -428,7 +442,7 @@ test('evaluatePortLeakResult accurately classifies local unverifiable sockets, o
       {
         port: 8291,
         protocol: 'TCP',
-        serviceName: 'MikroTik Winbox',
+        serviceName: 'TCP/8291 (MikroTik Winbox Candidate)',
         category: 'router_admin',
         descriptionFa: 'Winbox',
         descriptionEn: 'Winbox',
@@ -439,13 +453,13 @@ test('evaluatePortLeakResult accurately classifies local unverifiable sockets, o
       {
         port: 80,
         protocol: 'TCP',
-        serviceName: 'HTTP Router Admin',
+        serviceName: 'HTTP Web / TCP-80 Service',
         category: 'router_admin',
         descriptionFa: 'HTTP',
         descriptionEn: 'HTTP',
         state: 'closed',
         responseTimeMs: 15,
-        riskLevel: 'critical',
+        riskLevel: 'high',
       },
     ],
     startedAt: now,
@@ -453,31 +467,26 @@ test('evaluatePortLeakResult accurately classifies local unverifiable sockets, o
   });
   assert.equal(openPortRes.status, 'LEAK_DETECTED');
   assert.equal(openPortRes.isExposingSensitivePorts, true);
+  assert.equal(openPortRes.confidence, 'medium');
   assert.deepEqual(openPortRes.openPorts, [8291]);
 
-  // 3. Public IP with all ports closed/filtered -> PASS
+  // 3. Public IP with ALL expected ports in COMMON_SENSITIVE_PORTS closed/filtered -> PASS
+  const allClosedPorts = COMMON_SENSITIVE_PORTS.map((def, idx) => ({
+    ...def,
+    state: (idx % 2 === 0 ? 'closed' : 'filtered_timeout') as 'closed' | 'filtered_timeout',
+    responseTimeMs: idx % 2 === 0 ? 14 : null,
+  }));
   const closedPortRes = evaluatePortLeakResult({
     targetIp: '203.0.113.55',
     targetSource: 'server_socket',
     canScanFromServer: true,
-    ports: [
-      {
-        port: 80,
-        protocol: 'TCP',
-        serviceName: 'HTTP Router Admin',
-        category: 'router_admin',
-        descriptionFa: 'HTTP',
-        descriptionEn: 'HTTP',
-        state: 'closed',
-        responseTimeMs: 14,
-        riskLevel: 'critical',
-      },
-    ],
+    ports: allClosedPorts,
     startedAt: now,
     completedAt: now,
   });
   assert.equal(closedPortRes.status, 'PASS');
   assert.equal(closedPortRes.isExposingSensitivePorts, false);
+  assert.equal(closedPortRes.scannedPortsCount, COMMON_SENSITIVE_PORTS.length);
 });
 
 test('isGloballyRoutablePublicIp blocks all loopback, RFC1918, CGNAT, metadata, IPv4-mapped IPv6, and TEST-NET ranges against SSRF', () => {
@@ -756,6 +765,905 @@ test('createGlobeResourceManager disposes all Three.js resources, ResizeObserver
   assert.equal(rendererDisposeCount, 1);
   assert.equal(resizeDisconnectedCount, 1);
   assert.equal(cancelledFrameId, 42);
+});
+
+test('WebRTC UNSUPPORTED, ERROR, INCONCLUSIVE, or NOT_CONFIGURED never produce overall PASS or 100 privacy score', () => {
+  const now = new Date().toISOString();
+  const validIp: any = {
+    status: 'PASS',
+    ip: '198.51.100.10',
+    asn: 'AS24940',
+    isp: 'Hetzner Online GmbH',
+    countryCode: 'DE',
+    ipMismatchDetected: false,
+    isDatacenter: true,
+    fraudRiskScore: null,
+  };
+
+  const validDns = evaluateDnsTestResult({
+    runId: 'run-valid-100',
+    authoritativeConfigured: true,
+    resolvers: [
+      {
+        id: 'cf-1',
+        name: 'Cloudflare',
+        primaryIp: '1.1.1.1',
+        asn: 'AS13335',
+        isp: 'Cloudflare, Inc.',
+        location: 'Anycast',
+        status: 'OK',
+        responseTimeMs: 10,
+        isEncryptedDoH: true,
+        observationMethod: 'authoritative_dns_log',
+      },
+    ],
+    ipDetails: validIp,
+    startedAt: now,
+    completedAt: now,
+  });
+  assert.equal(validDns.status, 'PASS');
+
+  const webRtcUnsupported = evaluateWebRtcCandidates({
+    isSupported: false,
+    candidates: [],
+    referencePublicIps: ['198.51.100.10'],
+    stunServersUsed: ['stun:stun.l.google.com:19302'],
+    startedAt: now,
+    completedAt: now,
+  });
+  assert.equal(webRtcUnsupported.status, 'UNSUPPORTED');
+
+  const summaryWithUnsupportedWebRtc = evaluateOverallSummary({
+    ipDetails: validIp,
+    dnsLeak: validDns,
+    webRtcLeak: webRtcUnsupported,
+    vpnProxy: evaluateVpnHeuristic(validIp, validDns),
+  });
+  assert.notEqual(summaryWithUnsupportedWebRtc.overallStatus, 'PASS');
+  assert.equal(summaryWithUnsupportedWebRtc.overallStatus, 'INCONCLUSIVE');
+  assert.equal(summaryWithUnsupportedWebRtc.isScoreCalculable, false);
+  assert.equal(summaryWithUnsupportedWebRtc.privacyScore, null);
+
+  // Also verify WebRTC ERROR -> overallStatus is ERROR, score is null
+  const webRtcError = evaluateWebRtcCandidates({
+    isSupported: true,
+    candidates: [],
+    referencePublicIps: ['198.51.100.10'],
+    stunServersUsed: ['stun:stun.l.google.com:19302'],
+    startedAt: now,
+    completedAt: now,
+    errorMessage: 'RTCPeerConnection blocked',
+  });
+  const summaryWithErrorWebRtc = evaluateOverallSummary({
+    ipDetails: validIp,
+    dnsLeak: validDns,
+    webRtcLeak: webRtcError,
+    vpnProxy: evaluateVpnHeuristic(validIp, validDns),
+  });
+  assert.equal(summaryWithErrorWebRtc.overallStatus, 'ERROR');
+  assert.equal(summaryWithErrorWebRtc.isScoreCalculable, false);
+  assert.equal(summaryWithErrorWebRtc.privacyScore, null);
+});
+
+test('evaluateDnsTestResult ignores status text strings and requires structured evidence; resolver without comparison metadata or country difference alone is INCONCLUSIVE', () => {
+  const now = new Date().toISOString();
+  const baseIpDetails: any = {
+    status: 'PASS',
+    ip: '198.51.100.10',
+    countryCode: 'DE',
+    asn: 'AS24940',
+    isp: 'Hetzner Online GmbH',
+    isDatacenter: true,
+  };
+
+  // 1. A resolver with NO comparison metadata (missing asn & isp, not matching egress IP) -> INCONCLUSIVE (neither PASS nor LEAK_DETECTED)
+  const bareResolverRes = evaluateDnsTestResult({
+    runId: 'run-bare-1',
+    authoritativeConfigured: true,
+    resolvers: [
+      {
+        id: 'r-bare',
+        name: 'Unknown Resolver',
+        primaryIp: '9.9.9.9',
+        location: 'DE',
+        status: 'مغایرت کشور با تونل (Leak)', // Even with "Leak" / "مغایرت" in status string, must NOT trigger LEAK_DETECTED!
+        responseTimeMs: 20,
+        isEncryptedDoH: null,
+        observationMethod: 'authoritative_dns_log',
+      },
+    ],
+    ipDetails: baseIpDetails,
+    startedAt: now,
+    completedAt: now,
+  });
+  assert.equal(bareResolverRes.status, 'INCONCLUSIVE');
+  assert.equal(bareResolverRes.isLeaking, null);
+
+  // 2. Country difference alone (e.g. DE vs NL) without unencrypted ISP/ASN leak conflict -> INCONCLUSIVE (not LEAK_DETECTED)
+  const countryDiffOnlyRes = evaluateDnsTestResult({
+    runId: 'run-country-diff',
+    authoritativeConfigured: true,
+    resolvers: [
+      {
+        id: 'r-nl',
+        name: 'Hetzner NL Resolver',
+        primaryIp: '185.12.64.1',
+        asn: 'AS24940', // Same ASN as tunnel!
+        isp: 'Hetzner Online GmbH',
+        location: 'NL', // Different country (Netherlands vs Germany)
+        status: 'Leak', // Status text must be ignored
+        responseTimeMs: 15,
+        isEncryptedDoH: false,
+        observationMethod: 'authoritative_dns_log',
+      },
+    ],
+    ipDetails: baseIpDetails,
+    startedAt: now,
+    completedAt: now,
+  });
+  assert.equal(countryDiffOnlyRes.status, 'INCONCLUSIVE');
+  assert.equal(countryDiffOnlyRes.isLeaking, null);
+
+  // 3. Mismatched runId on resolver event -> INCONCLUSIVE
+  const mismatchedRunIdRes = evaluateDnsTestResult({
+    runId: 'run-active-111',
+    authoritativeConfigured: true,
+    resolvers: [
+      {
+        id: 'r-wrong-run',
+        name: 'Cloudflare',
+        primaryIp: '1.1.1.1',
+        asn: 'AS13335',
+        isp: 'Cloudflare, Inc.',
+        location: 'Anycast',
+        runId: 'run-stale-999',
+        status: 'OK',
+        responseTimeMs: 12,
+        isEncryptedDoH: true,
+        observationMethod: 'authoritative_dns_log',
+      },
+    ],
+    ipDetails: baseIpDetails,
+    startedAt: now,
+    completedAt: now,
+  });
+  assert.equal(mismatchedRunIdRes.status, 'INCONCLUSIVE');
+  assert.equal(mismatchedRunIdRes.errorCode, 'RUN_ID_MISMATCH');
+  assert.equal(mismatchedRunIdRes.isLeaking, null);
+
+  // 4. Missing ipDetails -> INCONCLUSIVE (cannot compare resolvers without primary egress IP)
+  const missingIpDetailsRes = evaluateDnsTestResult({
+    runId: 'run-no-ip',
+    authoritativeConfigured: true,
+    resolvers: [
+      {
+        id: 'r-cf',
+        name: 'Cloudflare',
+        primaryIp: '1.1.1.1',
+        asn: 'AS13335',
+        isp: 'Cloudflare, Inc.',
+        location: 'Anycast',
+        status: 'OK',
+        responseTimeMs: 12,
+        isEncryptedDoH: true,
+        observationMethod: 'authoritative_dns_log',
+      },
+    ],
+    ipDetails: null,
+    startedAt: now,
+    completedAt: now,
+  });
+  assert.equal(missingIpDetailsRes.status, 'INCONCLUSIVE');
+  assert.equal(missingIpDetailsRes.isLeaking, null);
+});
+
+test('evaluateIndependentBrowserDnsObservation sets matchesPrimaryEgressIp=true ONLY on exact edge_trace_egress IP match and never treats country difference as LEAK_DETECTED', () => {
+  const mockIpDetails: any = {
+    status: 'PASS',
+    ip: '198.51.100.10',
+    countryCode: 'DE',
+    countryName: 'Germany',
+  };
+
+  // 1. Country difference in EDNS resolver (e.g. Iran vs DE) in browser check is INCONCLUSIVE, not LEAK_DETECTED, and matchesPrimaryEgressIp is null
+  const geoDiffObs = evaluateIndependentBrowserDnsObservation(
+    [
+      {
+        sourceName: 'ip-api EDNS Recursive Resolver',
+        observedIp: '91.98.0.1',
+        locationOrGeo: 'Iran - TCI',
+        role: 'edns_recursive_resolver',
+        responseTimeMs: 50,
+      },
+    ],
+    mockIpDetails
+  );
+  assert.equal(geoDiffObs.status, 'INCONCLUSIVE');
+  assert.equal(geoDiffObs.matchesPrimaryEgressIp, null);
+
+  // 2. Exact IP match of same data type (`edge_trace_egress`) sets matchesPrimaryEgressIp = true, while status remains INCONCLUSIVE (not substitute for authoritative DNS)
+  const matchingEdgeObs = evaluateIndependentBrowserDnsObservation(
+    [
+      {
+        sourceName: 'Cloudflare Edge Trace (FRA)',
+        observedIp: '::ffff:198.51.100.10', // Canonically matches 198.51.100.10
+        locationOrGeo: 'DE',
+        role: 'edge_trace_egress',
+        responseTimeMs: 28,
+      },
+    ],
+    mockIpDetails
+  );
+  assert.equal(matchingEdgeObs.matchesPrimaryEgressIp, true);
+  assert.equal(matchingEdgeObs.status, 'INCONCLUSIVE');
+
+  // 3. Mismatched `edge_trace_egress` IP sets matchesPrimaryEgressIp = false and status = WARNING
+  const mismatchedEdgeObs = evaluateIndependentBrowserDnsObservation(
+    [
+      {
+        sourceName: 'Cloudflare Edge Trace (FRA)',
+        observedIp: '203.0.113.77',
+        locationOrGeo: 'DE',
+        role: 'edge_trace_egress',
+        responseTimeMs: 31,
+      },
+    ],
+    mockIpDetails
+  );
+  assert.equal(mismatchedEdgeObs.matchesPrimaryEgressIp, false);
+  assert.equal(mismatchedEdgeObs.status, 'WARNING');
+});
+
+test('evaluatePortLeakResult never issues PASS for incomplete or not_tested ports and classifies generic open TCP port as WARNING with medium confidence', () => {
+  const now = new Date().toISOString();
+
+  // 1. Only 1 port tested (7 ports missing/not_tested) -> INCONCLUSIVE, never PASS
+  const partialPortsRes = evaluatePortLeakResult({
+    targetIp: '203.0.113.55',
+    targetSource: 'server_socket',
+    canScanFromServer: true,
+    ports: [
+      {
+        port: 80,
+        protocol: 'TCP',
+        serviceName: 'HTTP Web / TCP-80 Service',
+        category: 'router_admin',
+        descriptionFa: 'HTTP',
+        descriptionEn: 'HTTP',
+        state: 'closed',
+        responseTimeMs: 14,
+        riskLevel: 'high',
+      },
+    ],
+    startedAt: now,
+    completedAt: now,
+  });
+  assert.equal(partialPortsRes.status, 'INCONCLUSIVE');
+  assert.equal(partialPortsRes.isExposingSensitivePorts, null);
+  assert.equal(partialPortsRes.errorCode, 'INCOMPLETE_PORT_SCAN');
+
+  // 2. All 8 ports provided, but one port has state === 'not_tested' -> INCONCLUSIVE
+  const oneNotTestedPorts = COMMON_SENSITIVE_PORTS.map((def, idx) => ({
+    ...def,
+    state: (idx === 0 ? 'not_tested' : 'closed') as 'not_tested' | 'closed',
+    responseTimeMs: idx === 0 ? null : 12,
+  }));
+  const oneNotTestedRes = evaluatePortLeakResult({
+    targetIp: '203.0.113.55',
+    targetSource: 'server_socket',
+    canScanFromServer: true,
+    ports: oneNotTestedPorts,
+    startedAt: now,
+    completedAt: now,
+  });
+  assert.equal(oneNotTestedRes.status, 'INCONCLUSIVE');
+  assert.equal(oneNotTestedRes.isExposingSensitivePorts, null);
+
+  // 3. Open TCP/443 or TCP/80 (non-critical service port) -> WARNING with medium confidence (does not claim confirmed router admin panel exposure)
+  const genericOpenPorts = COMMON_SENSITIVE_PORTS.map(def => ({
+    ...def,
+    state: (def.port === 443 ? 'open' : 'closed') as 'open' | 'closed',
+    responseTimeMs: 19,
+  }));
+  const genericOpenRes = evaluatePortLeakResult({
+    targetIp: '203.0.113.55',
+    targetSource: 'server_socket',
+    canScanFromServer: true,
+    ports: genericOpenPorts,
+    startedAt: now,
+    completedAt: now,
+  });
+  assert.equal(genericOpenRes.status, 'WARNING');
+  assert.equal(genericOpenRes.confidence, 'medium');
+  assert.equal(genericOpenRes.isExposingSensitivePorts, true);
+  assert.deepEqual(genericOpenRes.openPorts, [443]);
+});
+
+test('strict RFC IPv4/IPv6 validation, hex IPv4-mapped IPv6, and isSafeExternalUrl SSRF protection', () => {
+  // Malformed IPv4 & leading-zero octal ambiguity
+  assert.equal(isValidIpv4('010.0.0.1'), false);
+  assert.equal(isValidIpv4('127.0.0.01'), false);
+  assert.equal(isValidIpv4('1.2.3.4.5'), false);
+  assert.equal(isValidIpv4('1.2.3'), false);
+
+  // Malformed IPv6 strings that naive regexes accept
+  assert.equal(isValidIpv6(':::'), false);
+  assert.equal(isValidIpv6('2001:db8::1::2'), false);
+  assert.equal(isValidIpv6(':1:2:3:4:5:6:7:8'), false);
+  assert.equal(isValidIpv6('1:2:3:4:5:6:7:8:'), false);
+  assert.equal(isValidIpv6('1:2:3:4:5:6:7:8:9'), false);
+  assert.equal(isValidIpv6('::ffff:999.1.1.1'), false);
+  assert.equal(isValidIpv6('fe80::1%'), false);
+
+  // Valid IPv6 forms including IPv4-embedded and zone index
+  assert.equal(isValidIpv6('::ffff:192.0.2.128'), true);
+  assert.equal(isValidIpv6('fe80::1%eth0'), true);
+  assert.equal(canonicalizeIp('::ffff:198.51.100.10'), '198.51.100.10');
+  assert.equal(canonicalizeIp('0:0:0:0:0:ffff:c633:640a'), '198.51.100.10');
+
+  // Hex-encoded IPv4-mapped IPv6 loopback/private/metadata must be blocked by isGloballyRoutablePublicIp
+  assert.equal(isGloballyRoutablePublicIp('::ffff:7f00:1'), false); // 127.0.0.1 in hex
+  assert.equal(isGloballyRoutablePublicIp('0:0:0:0:0:ffff:a9fe:a9fe'), false); // 169.254.169.254 in hex
+  assert.equal(isGloballyRoutablePublicIp('0:0:0:0:0:ffff:a00:1'), false); // 10.0.0.1 in hex
+  assert.equal(isGloballyRoutablePublicIp('64:ff9b::8.8.8.8'), false); // NAT64 prefix
+  assert.equal(isGloballyRoutablePublicIp('2001::1'), false); // Teredo prefix
+  assert.equal(isGloballyRoutablePublicIp('2002:0808:0808::1'), false); // 6to4 prefix
+  assert.equal(isGloballyRoutablePublicIp('fe80::1%eth0'), false); // Scoped link-local
+
+  // isSafeExternalUrl SSRF checks
+  assert.equal(isSafeExternalUrl('https://collector.example.com/api/dns').valid, true);
+  assert.equal(isSafeExternalUrl('http://127.0.0.1:8080/test').valid, false);
+  assert.equal(isSafeExternalUrl('http://[::ffff:7f00:1]/test').valid, false);
+  assert.equal(isSafeExternalUrl('http://169.254.169.254/latest/meta-data/').valid, false);
+  assert.equal(isSafeExternalUrl('http://metadata.google.internal/computeMetadata/v1/').valid, false);
+  assert.equal(isSafeExternalUrl('http://2130706433/').valid, false); // Decimal 127.0.0.1
+  assert.equal(isSafeExternalUrl('http://0x7f000001/').valid, false); // Hex 127.0.0.1
+  assert.equal(isSafeExternalUrl('https://user:pass@example.com/').valid, false); // Embedded credentials
+  assert.equal(isSafeExternalUrl('ftp://example.com/file').valid, false);
+});
+
+test('evaluateObservedIpSources distinguishes dual-stack IPv4+IPv6 from same-family split-tunnel IP mismatch', () => {
+  // 1. Dual-stack: one IPv6 from ipify and one IPv4 from ipwho.is/server -> NOT a split-tunnel leak
+  const dualStackEval = evaluateObservedIpSources([
+    {
+      sourceName: 'api64.ipify.org',
+      ip: '2a01:4f8:c010:1234::1',
+      version: 'IPv6',
+      observedFrom: 'client_direct',
+      responseTimeMs: 45,
+    },
+    {
+      sourceName: 'ipwho.is',
+      ip: '198.51.100.10',
+      version: 'IPv4',
+      observedFrom: 'client_direct',
+      responseTimeMs: 60,
+    },
+  ]);
+  assert.equal(dualStackEval.isDualStackObserved, true);
+  assert.equal(dualStackEval.ipMismatchDetected, false);
+  assert.deepEqual(dualStackEval.uniqueIpv4s, ['198.51.100.10']);
+  assert.equal(dualStackEval.uniqueIpv6s.length, 1);
+
+  // 2. Same-family mismatch: two different IPv4 addresses -> confirmed split-tunnel / path mismatch
+  const v4MismatchEval = evaluateObservedIpSources([
+    {
+      sourceName: 'ipwho.is',
+      ip: '198.51.100.10',
+      version: 'IPv4',
+      observedFrom: 'client_direct',
+      responseTimeMs: 50,
+    },
+    {
+      sourceName: 'App Server',
+      ip: '203.0.113.99',
+      version: 'IPv4',
+      observedFrom: 'server_socket',
+      responseTimeMs: 20,
+    },
+  ]);
+  assert.equal(v4MismatchEval.ipMismatchDetected, true);
+  assert.equal(v4MismatchEval.isDualStackObserved, false);
+
+  // 3. Canonical IPv4-mapped IPv6 matching same IPv4 -> no mismatch
+  const mappedMatchEval = evaluateObservedIpSources([
+    {
+      sourceName: 'Client Direct',
+      ip: '198.51.100.10',
+      version: 'IPv4',
+      observedFrom: 'client_direct',
+      responseTimeMs: 30,
+    },
+    {
+      sourceName: 'Server Socket',
+      ip: '::ffff:198.51.100.10',
+      version: 'IPv6',
+      observedFrom: 'server_socket',
+      responseTimeMs: 12,
+    },
+  ]);
+  assert.equal(mappedMatchEval.ipMismatchDetected, false);
+  assert.equal(mappedMatchEval.uniqueIpv4s.length, 1);
+});
+
+test('evaluateWebRtcCandidates handles dual-stack IPv6 STUN candidates without false PASS or false LEAK when only IPv4 reference exists', () => {
+  const now = new Date().toISOString();
+
+  // Only IPv4 reference IP exists, but STUN discovers an IPv6 public candidate -> WARNING (Dual-Stack unverified), not PASS
+  const dualStackWebRtc = evaluateWebRtcCandidates({
+    isSupported: true,
+    candidates: [
+      {
+        ip: '2a01:4f8:c010:1234::1',
+        version: 'IPv6',
+        type: 'srflx',
+        protocol: 'UDP',
+        port: 52000,
+        isLocalLanIp: false,
+        isPublicIp: true,
+      },
+    ],
+    referencePublicIps: ['198.51.100.10'],
+    stunServersUsed: ['stun:stun.l.google.com:19302'],
+    startedAt: now,
+    completedAt: now,
+  });
+  assert.equal(dualStackWebRtc.status, 'WARNING');
+  assert.equal(dualStackWebRtc.isLeakingRealIp, null);
+  assert.equal(dualStackWebRtc.errorCode, 'DUAL_STACK_FAMILY_UNVERIFIED');
+
+  // When both IPv4 and IPv6 reference IPs are provided and match -> PASS
+  const verifiedDualStack = evaluateWebRtcCandidates({
+    isSupported: true,
+    candidates: [
+      {
+        ip: '2a01:4f8:c010:1234::1',
+        version: 'IPv6',
+        type: 'srflx',
+        protocol: 'UDP',
+        port: 52000,
+        isLocalLanIp: false,
+        isPublicIp: true,
+      },
+    ],
+    referencePublicIps: ['198.51.100.10', '2a01:4f8:c010:1234:0:0:0:1'],
+    stunServersUsed: ['stun:stun.l.google.com:19302'],
+    startedAt: now,
+    completedAt: now,
+  });
+  assert.equal(verifiedDualStack.status, 'PASS');
+  assert.equal(verifiedDualStack.isLeakingRealIp, false);
+});
+
+test('validateAiAuditPayload strictly validates Gemini JSON schema and rejects malformed or out-of-range outputs', () => {
+  // Valid payload
+  const validCheck = validateAiAuditPayload({
+    riskScore: 25,
+    statusLevel: 'هشدار',
+    summaryFa: 'خلاصه معتبر تست شبکه',
+    detailedAnalysisFa: ['مورد اول', 'مورد دوم'],
+    threatsFoundFa: ['ریسک جزئی'],
+    recommendationsFa: ['توصیه اول'],
+  });
+  assert.equal(validCheck.valid, true);
+  assert.equal(validCheck.audit?.riskScore, 25);
+  assert.equal(validCheck.audit?.statusLevel, 'هشدار');
+
+  // Invalid statusLevel
+  assert.equal(
+    validateAiAuditPayload({
+      riskScore: 10,
+      statusLevel: 'SAFE_FAKE',
+      summaryFa: 'متن',
+      detailedAnalysisFa: [],
+      threatsFoundFa: [],
+      recommendationsFa: [],
+    }).valid,
+    false
+  );
+
+  // Out-of-bounds riskScore
+  assert.equal(
+    validateAiAuditPayload({
+      riskScore: 150,
+      statusLevel: 'امن',
+      summaryFa: 'متن',
+      detailedAnalysisFa: [],
+      threatsFoundFa: [],
+      recommendationsFa: [],
+    }).valid,
+    false
+  );
+
+  // Non-array detailedAnalysisFa or non-object payload
+  assert.equal(
+    validateAiAuditPayload({
+      riskScore: null,
+      statusLevel: 'نامشخص',
+      summaryFa: 'متن',
+      detailedAnalysisFa: 'not-an-array',
+      threatsFoundFa: [],
+      recommendationsFa: [],
+    }).valid,
+    false
+  );
+  assert.equal(validateAiAuditPayload(null).valid, false);
+  assert.equal(validateAiAuditPayload(['array']).valid, false);
+});
+
+test('createBoundedSignal and RUNNING status support work accurately for cancellation and lifecycle states', () => {
+  const controller = new AbortController();
+  const bounded = createBoundedSignal(10_000, controller.signal);
+  assert.equal(bounded.aborted, false);
+  controller.abort();
+  assert.equal(bounded.aborted, true);
+
+  assert.equal(formatTestStatusLabelFa('RUNNING'), 'در حال آزمایش...');
+  assert.equal(formatTestStatusLabelFa('IDLE'), 'اجرا نشده');
+
+  const runningGlobe = resolveGlobeVisualStatus('RUNNING', null);
+  assert.equal(runningGlobe.visualCategory, 'inconclusive');
+  assert.equal(runningGlobe.isPass, false);
+
+  const errGlobe = resolveGlobeVisualStatus('ERROR', null);
+  assert.equal(errGlobe.badgeTextFa, 'خطا در اجرای تست؛ نتیجه قابل تأیید نیست');
+  assert.equal(errGlobe.badgeTextEn, 'Test execution failed; result cannot be verified.');
+});
+
+test('Cloudflare Worker keeps DNS test NOT_CONFIGURED until UDP/53 is verified and enforces strict runId + Bearer auth on ingest', async () => {
+  const kvStore = new Map<string, string>();
+  const mockKv = {
+    async get(key: string) {
+      return kvStore.get(key) ?? null;
+    },
+    async put(key: string, value: string) {
+      kvStore.set(key, value);
+    },
+  };
+
+  // 1. Default unverified state -> authoritativeConfigured must be false («پیکربندی نشده»)
+  const unverifiedEnv: CloudflareEnv = {
+    DNS_LEAK_DOMAIN: '',
+    DNS_UDP53_VERIFIED: 'false',
+    DNS_LOGS_KV: mockKv,
+  };
+
+  const probeUnconfiguredResp = await cloudflareWorker.fetch(
+    new Request('https://example.workers.dev/api/dns-leak-probe?runId=run-12345678'),
+    unverifiedEnv
+  );
+  assert.equal(probeUnconfiguredResp.status, 200);
+  const probeUnconfiguredJson: any = await probeUnconfiguredResp.json();
+  assert.equal(probeUnconfiguredJson.authoritativeConfigured, false);
+  assert.deepEqual(probeUnconfiguredJson.resolvers, []);
+  assert.ok(probeUnconfiguredJson.messageFa.includes('پیکربندی نشده'));
+
+  // 2. Even if DNS_LEAK_DOMAIN is set, without DNS_UDP53_VERIFIED="true", it MUST remain NOT_CONFIGURED
+  const halfConfiguredEnv: CloudflareEnv = {
+    DNS_LEAK_DOMAIN: 'leak.example.com',
+    DNS_COLLECTOR_API_TOKEN: 'test-secret-token-for-unit-test-only',
+    DNS_UDP53_VERIFIED: 'false',
+    DNS_LOGS_KV: mockKv,
+  };
+  const halfResp = await cloudflareWorker.fetch(
+    new Request('https://example.workers.dev/api/dns-leak-probe?runId=run-12345678'),
+    halfConfiguredEnv
+  );
+  const halfJson: any = await halfResp.json();
+  assert.equal(halfJson.authoritativeConfigured, false);
+
+  // 3. Fully configured & verified environment
+  const verifiedEnv: CloudflareEnv = {
+    DNS_LEAK_DOMAIN: 'leak.example.com',
+    DNS_COLLECTOR_API_TOKEN: 'test-secret-token-for-unit-test-only',
+    DNS_UDP53_VERIFIED: 'true',
+    DNS_LOGS_KV: mockKv,
+  };
+
+  // Health endpoint must NEVER leak the secret token
+  const healthResp = await cloudflareWorker.fetch(
+    new Request('https://example.workers.dev/api/health'),
+    verifiedEnv
+  );
+  const healthText = await healthResp.text();
+  assert.equal(healthText.includes('test-secret-token-for-unit-test-only'), false);
+  const healthJson = JSON.parse(healthText);
+  assert.equal(healthJson.optionalIntegrations.authoritativeDnsConfigured, true);
+
+  // 4. Ingest without valid Bearer token -> 401 Unauthorized
+  const unauthorizedIngest = await cloudflareWorker.fetch(
+    new Request('https://example.workers.dev/api/dns-collector/ingest', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer wrong-token' },
+      body: JSON.stringify({ runId: 'run-12345678', resolverIp: '9.9.9.9' }),
+    }),
+    verifiedEnv
+  );
+  assert.equal(unauthorizedIngest.status, 401);
+
+  // 5. Ingest with private/loopback IP -> 400 Bad Request
+  const privateIpIngest = await cloudflareWorker.fetch(
+    new Request('https://example.workers.dev/api/dns-collector/ingest', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer test-secret-token-for-unit-test-only',
+      },
+      body: JSON.stringify({ runId: 'run-12345678', resolverIp: '127.0.0.1' }),
+    }),
+    verifiedEnv
+  );
+  assert.equal(privateIpIngest.status, 400);
+
+  // 6. Ingest with mismatched qname vs runId -> 400 Bad Request
+  const mismatchQnameIngest = await cloudflareWorker.fetch(
+    new Request('https://example.workers.dev/api/dns-collector/ingest', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer test-secret-token-for-unit-test-only',
+      },
+      body: JSON.stringify({
+        runId: 'run-12345678',
+        resolverIp: '9.9.9.9',
+        qname: 'p1.other-run-99999999.leak.example.com',
+      }),
+    }),
+    verifiedEnv
+  );
+  assert.equal(mismatchQnameIngest.status, 400);
+
+  // 7. Valid ingest for run-12345678
+  const validIngest = await cloudflareWorker.fetch(
+    new Request('https://example.workers.dev/api/dns-collector/ingest', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer test-secret-token-for-unit-test-only',
+      },
+      body: JSON.stringify({
+        runId: 'run-12345678',
+        resolverIp: '9.9.9.9',
+        isp: 'Quad9 Recursive DNS',
+        asn: 'AS19281',
+        countryCode: 'CH',
+        qname: 'p1.run-12345678.leak.example.com',
+      }),
+    }),
+    verifiedEnv
+  );
+  assert.equal(validIngest.status, 200);
+
+  // 8. Querying probe for a DIFFERENT runId returns empty resolvers (no cross-session leakage)
+  const otherProbe = await cloudflareWorker.fetch(
+    new Request('https://example.workers.dev/api/dns-leak-probe?runId=run-99999999'),
+    verifiedEnv
+  );
+  const otherProbeJson: any = await otherProbe.json();
+  assert.equal(otherProbeJson.authoritativeConfigured, true);
+  assert.equal(otherProbeJson.resolvers.length, 0);
+
+  // 9. Querying probe for matching run-12345678 returns the verified UDP/53 resolver
+  const matchingProbe = await cloudflareWorker.fetch(
+    new Request('https://example.workers.dev/api/dns-leak-probe?runId=run-12345678'),
+    verifiedEnv
+  );
+  const matchingProbeJson: any = await matchingProbe.json();
+  assert.equal(matchingProbeJson.authoritativeConfigured, true);
+  assert.equal(matchingProbeJson.resolvers.length, 1);
+  assert.equal(matchingProbeJson.resolvers[0].primaryIp, '9.9.9.9');
+  assert.equal(matchingProbeJson.resolvers[0].runId, 'run-12345678');
+  assert.equal(matchingProbeJson.resolvers[0].observationMethod, 'authoritative_dns_log');
+});
+
+test('DNS anti-replay, stale timestamp rejection, CGNAT/TEST-NET rejection, token rotation, and 413 payload limit work accurately', async () => {
+  const sampleIpDetails: any = {
+    status: 'PASS',
+    ip: '185.220.101.5',
+    asn: 'AS200000',
+    isp: 'Privacy VPN Provider',
+    countryCode: 'DE',
+  };
+
+  // 1. Stale observation timestamp (>5 minutes old) is rejected by evaluateDnsTestResult
+  const nowIso = new Date().toISOString();
+  const staleIso = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+  const staleEval = evaluateDnsTestResult({
+    runId: 'run-fresh-001',
+    authoritativeConfigured: true,
+    startedAt: nowIso,
+    completedAt: nowIso,
+    resolvers: [
+      {
+        id: 'r1',
+        name: 'Quad9',
+        primaryIp: '9.9.9.9',
+        asn: 'AS19281',
+        isp: 'Quad9',
+        location: 'CH',
+        countryCode: 'CH',
+        runId: 'run-fresh-001',
+        observedAt: staleIso,
+        status: 'Observed',
+        responseTimeMs: null,
+        isEncryptedDoH: null,
+        observationMethod: 'authoritative_dns_log',
+      },
+    ],
+    ipDetails: sampleIpDetails,
+  });
+  assert.equal(staleEval.status, 'INCONCLUSIVE');
+  assert.equal(staleEval.errorCode, 'STALE_DNS_OBSERVATION');
+
+  // 2. CGNAT (100.64.0.1) or TEST-NET (198.51.100.1) resolver IP is rejected by evaluateDnsTestResult
+  const cgnatEval = evaluateDnsTestResult({
+    runId: 'run-cgnat-001',
+    authoritativeConfigured: true,
+    startedAt: nowIso,
+    completedAt: nowIso,
+    resolvers: [
+      {
+        id: 'r2',
+        name: 'CGNAT Fake Resolver',
+        primaryIp: '100.64.0.1',
+        asn: 'AS200000',
+        isp: 'Privacy VPN Provider',
+        location: 'DE',
+        countryCode: 'DE',
+        runId: 'run-cgnat-001',
+        status: 'Observed',
+        responseTimeMs: null,
+        isEncryptedDoH: null,
+        observationMethod: 'authoritative_dns_log',
+      },
+    ],
+    ipDetails: sampleIpDetails,
+  });
+  assert.equal(cgnatEval.status, 'INCONCLUSIVE');
+  assert.equal(cgnatEval.errorCode, 'INVALID_RESOLVER_EVIDENCE');
+
+  // 3. Cloudflare Worker token rotation (DNS_COLLECTOR_API_TOKEN_PREVIOUS), stale timestamp, domain mismatch, and 413 payload limit
+  const kvStore = new Map<string, string>();
+  const rotationEnv: CloudflareEnv = {
+    DNS_LEAK_DOMAIN: 'leak.example.com',
+    DNS_COLLECTOR_API_TOKEN: 'new-rotated-token-2026',
+    DNS_COLLECTOR_API_TOKEN_PREVIOUS: 'old-previous-token-2026',
+    DNS_UDP53_VERIFIED: 'true',
+    DNS_LOGS_KV: {
+      async get(k) {
+        return kvStore.get(k) ?? null;
+      },
+      async put(k, v) {
+        kvStore.set(k, v);
+      },
+    },
+  };
+
+  // Ingest using previous token during rotation succeeds
+  const prevTokenIngest = await cloudflareWorker.fetch(
+    new Request('https://example.workers.dev/api/dns-collector/ingest', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer old-previous-token-2026',
+      },
+      body: JSON.stringify({
+        runId: 'run-rot-12345678',
+        resolverIp: '1.1.1.1',
+        qname: 'p1.run-rot-12345678.leak.example.com',
+        observedAt: new Date().toISOString(),
+      }),
+    }),
+    rotationEnv
+  );
+  assert.equal(prevTokenIngest.status, 200);
+
+  // Ingest with stale timestamp is rejected with 400 STALE_OR_FUTURE_TIMESTAMP
+  const staleIngest = await cloudflareWorker.fetch(
+    new Request('https://example.workers.dev/api/dns-collector/ingest', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer new-rotated-token-2026',
+      },
+      body: JSON.stringify({
+        runId: 'run-rot-12345678',
+        resolverIp: '8.8.8.8',
+        qname: 'p2.run-rot-12345678.leak.example.com',
+        observedAt: staleIso,
+      }),
+    }),
+    rotationEnv
+  );
+  assert.equal(staleIngest.status, 400);
+  const staleIngestJson: any = await staleIngest.json();
+  assert.equal(staleIngestJson.errorCode, 'STALE_OR_FUTURE_TIMESTAMP');
+
+  // Ingest with wrong domain suffix is rejected with 400 QNAME_DOMAIN_MISMATCH
+  const wrongDomainIngest = await cloudflareWorker.fetch(
+    new Request('https://example.workers.dev/api/dns-collector/ingest', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer new-rotated-token-2026',
+      },
+      body: JSON.stringify({
+        runId: 'run-rot-12345678',
+        resolverIp: '8.8.8.8',
+        qname: 'p2.run-rot-12345678.evil.example.org',
+      }),
+    }),
+    rotationEnv
+  );
+  assert.equal(wrongDomainIngest.status, 400);
+  const wrongDomainJson: any = await wrongDomainIngest.json();
+  assert.equal(wrongDomainJson.errorCode, 'QNAME_DOMAIN_MISMATCH');
+
+  // Ingest with oversized payload (>32KB) is rejected with 413 PAYLOAD_TOO_LARGE
+  const oversizedPayload = JSON.stringify({
+    runId: 'run-rot-12345678',
+    resolverIp: '8.8.8.8',
+    padding: 'A'.repeat(40_000),
+  });
+  const oversizedIngest = await cloudflareWorker.fetch(
+    new Request('https://example.workers.dev/api/dns-collector/ingest', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer new-rotated-token-2026',
+      },
+      body: oversizedPayload,
+    }),
+    rotationEnv
+  );
+  assert.equal(oversizedIngest.status, 413);
+});
+
+test('Cloudflare Worker Static Assets binding, API routes, and wrangler.toml configuration are compatible and free of hardcoded secrets', async () => {
+  let assetsFetchedUrl: string | null = null;
+  const mockEnvWithAssets: CloudflareEnv = {
+    ASSETS: {
+      async fetch(req: Request) {
+        assetsFetchedUrl = req.url;
+        return new Response('<!doctype html><html><body>SPA Index</body></html>', {
+          status: 200,
+          headers: { 'Content-Type': 'text/html' },
+        });
+      },
+    },
+  };
+
+  // 1. Non-API path delegates to env.ASSETS.fetch(request)
+  const spaRes = await cloudflareWorker.fetch(
+    new Request('https://example.workers.dev/dashboard'),
+    mockEnvWithAssets
+  );
+  assert.equal(spaRes.status, 200);
+  assert.equal(assetsFetchedUrl, 'https://example.workers.dev/dashboard');
+  const spaHtml = await spaRes.text();
+  assert.match(spaHtml, /SPA Index/);
+
+  // 2. Unknown /api/* path returns 404 JSON from Worker and NEVER falls through to env.ASSETS
+  assetsFetchedUrl = null;
+  const unknownApiRes = await cloudflareWorker.fetch(
+    new Request('https://example.workers.dev/api/non-existent-endpoint'),
+    mockEnvWithAssets
+  );
+  assert.equal(unknownApiRes.status, 404);
+  assert.equal(assetsFetchedUrl, null);
+
+  // 3. /api/port-scan on Cloudflare Edge returns honest not_tested ports and never claims open/closed
+  const portScanRes = await cloudflareWorker.fetch(
+    new Request('https://example.workers.dev/api/port-scan', {
+      headers: { 'CF-Connecting-IP': '198.51.100.42' },
+    }),
+    mockEnvWithAssets
+  );
+  assert.equal(portScanRes.status, 200);
+  const portScanJson: any = await portScanRes.json();
+  assert.equal(portScanJson.canScanFromServer, false);
+  assert.ok(Array.isArray(portScanJson.ports) && portScanJson.ports.length > 0);
+  assert.ok(portScanJson.ports.every((p: any) => p.state === 'not_tested'));
 });
 
 

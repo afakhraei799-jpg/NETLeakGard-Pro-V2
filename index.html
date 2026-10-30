@@ -1,6 +1,38 @@
 <!doctype html>
 <html lang="fa" dir="rtl" class="dark">
   <head>
+    <script>
+      (function() {
+        // AI Studio Runtime Environment Constraint: "HMR: Disabled. Ignore WebSocket errors."
+        var origConsoleError = console.error;
+        console.error = function() {
+          for (var i = 0; i < arguments.length; i++) {
+            var arg = arguments[i];
+            var str = typeof arg === 'string' ? arg : (arg && (arg.message || arg.stack) ? (arg.message || arg.stack) : String(arg || ''));
+            if (str && (str.indexOf('WebSocket closed without opened') !== -1 || str.indexOf('failed to connect to websocket') !== -1 || str.indexOf('WebSocket error') !== -1)) {
+              return;
+            }
+          }
+          origConsoleError.apply(console, arguments);
+        };
+        window.addEventListener('unhandledrejection', function(e) {
+          var reason = e && e.reason;
+          var msg = (reason && (reason.message || reason.stack || String(reason))) || '';
+          if (msg.indexOf('WebSocket closed without opened') !== -1 || msg.indexOf('failed to connect to websocket') !== -1) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+          }
+        }, true);
+        window.addEventListener('error', function(e) {
+          var msg = (e && e.message) || (e && e.error && (e.error.message || e.error.stack)) || '';
+          if (msg.indexOf('WebSocket closed without opened') !== -1 || msg.indexOf('failed to connect to websocket') !== -1) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            return true;
+          }
+        }, true);
+      })();
+    </script>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="theme-color" content="#020617" />

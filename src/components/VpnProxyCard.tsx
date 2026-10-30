@@ -59,7 +59,7 @@ export const VpnProxyCard: React.FC<VpnProxyCardProps> = ({ vpnProxy, lang }) =>
           )}
           <div className="leading-relaxed">
             <span className="font-bold block mb-0.5">
-              {vpnProxy?.isDatacenterIp === null
+              {!vpnProxy || vpnProxy.isDatacenterIp === null
                 ? isFa
                   ? 'طبقه‌بندی نامشخص'
                   : 'Inconclusive Classification'
