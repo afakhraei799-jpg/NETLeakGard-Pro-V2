@@ -6,6 +6,8 @@ import {
   isPrivateOrLocalAddress,
   isGloballyRoutablePublicIp,
   formatTestStatusLabelFa,
+  isValidGeoCoordinate,
+  resolveGlobeVisualStatus,
   parseIceCandidateLine,
   evaluateWebRtcCandidates,
   evaluateDnsTestResult,
@@ -15,6 +17,12 @@ import {
   evaluatePortLeakResult,
   evaluateOverallSummary
 } from './networkEvaluator';
+import * as THREE from 'three';
+import {
+  latLonToVector3,
+  createGlobeResourceManager,
+  initGlobeWebGLSafe,
+} from '../components/Globe3D';
 
 test('IP validation and RFC1918/mDNS private address classification', () => {
   assert.equal(isValidIpv4('1.1.1.1'), true);
@@ -521,5 +529,235 @@ test('formatTestStatusLabelFa translates all status enums into distinct Persian 
   assert.equal(formatTestStatusLabelFa('ERROR'), 'خطا در آزمون');
   assert.equal(formatTestStatusLabelFa(null), 'نامشخص');
 });
+
+test('isValidGeoCoordinate strictly validates finite latitude [-90, 90] and longitude [-180, 180]', () => {
+  assert.equal(isValidGeoCoordinate(35.6892, 51.389), true);
+  assert.equal(isValidGeoCoordinate(-90, -180), true);
+  assert.equal(isValidGeoCoordinate(90, 180), true);
+  assert.equal(isValidGeoCoordinate(0, 0), true);
+
+  // Out of bounds
+  assert.equal(isValidGeoCoordinate(90.001, 0), false);
+  assert.equal(isValidGeoCoordinate(-91, 0), false);
+  assert.equal(isValidGeoCoordinate(0, 180.001), false);
+  assert.equal(isValidGeoCoordinate(0, -181), false);
+
+  // Non-finite or non-numeric
+  assert.equal(isValidGeoCoordinate(Number.NaN, 50), false);
+  assert.equal(isValidGeoCoordinate(35, Number.POSITIVE_INFINITY), false);
+  assert.equal(isValidGeoCoordinate(Number.NEGATIVE_INFINITY, 10), false);
+  assert.equal(isValidGeoCoordinate(null, 51), false);
+  assert.equal(isValidGeoCoordinate(undefined, undefined), false);
+  assert.equal(isValidGeoCoordinate('35.68', '51.38'), false);
+});
+
+test('resolveGlobeVisualStatus separates PASS, LEAK_DETECTED, ERROR, and inconclusive states without false PASS', () => {
+  const validIp = { status: 'PASS' as const, ip: '8.8.8.8' };
+  const errorIp = { status: 'ERROR' as const, ip: null };
+
+  // 1. ERROR must not be marked as LEAK_DETECTED and must show exact Persian message
+  const errState = resolveGlobeVisualStatus('ERROR', errorIp);
+  assert.equal(errState.visualCategory, 'error');
+  assert.equal(errState.isError, true);
+  assert.equal(errState.isLeak, false);
+  assert.equal(errState.isPass, false);
+  assert.equal(errState.badgeTextFa, 'خطا در اجرای تست؛ نتیجه قابل تأیید نیست');
+
+  // 2. LEAK_DETECTED
+  const leakState = resolveGlobeVisualStatus('LEAK_DETECTED', validIp);
+  assert.equal(leakState.visualCategory, 'leak');
+  assert.equal(leakState.isLeak, true);
+  assert.equal(leakState.isError, false);
+  assert.equal(leakState.isPass, false);
+
+  // 3. PASS only when overallStatus is PASS AND ipDetails is valid PASS
+  const passState = resolveGlobeVisualStatus('PASS', validIp);
+  assert.equal(passState.visualCategory, 'pass');
+  assert.equal(passState.isPass, true);
+  assert.equal(passState.isLeak, false);
+  assert.equal(passState.isError, false);
+
+  // 4. Incomplete/invalid ipDetails with PASS overallStatus must NOT become PASS
+  const fakePassNullIp = resolveGlobeVisualStatus('PASS', null);
+  assert.equal(fakePassNullIp.visualCategory, 'inconclusive');
+  assert.equal(fakePassNullIp.isPass, false);
+
+  const fakePassErrorIp = resolveGlobeVisualStatus('PASS', errorIp);
+  assert.equal(fakePassErrorIp.visualCategory, 'inconclusive');
+  assert.equal(fakePassErrorIp.isPass, false);
+
+  // 5. INCONCLUSIVE and NOT_CONFIGURED
+  const incState = resolveGlobeVisualStatus('INCONCLUSIVE', validIp);
+  assert.equal(incState.visualCategory, 'inconclusive');
+  assert.equal(incState.isPass, false);
+  assert.equal(incState.isLeak, false);
+  assert.equal(incState.isError, false);
+});
+
+test('latLonToVector3 returns null for invalid coordinates and finite 3D vectors for valid coordinates', () => {
+  assert.equal(latLonToVector3(Number.NaN, 51.38, 2.25), null);
+  assert.equal(latLonToVector3(35.68, Number.POSITIVE_INFINITY, 2.25), null);
+  assert.equal(latLonToVector3(95, 10, 2.25), null);
+  assert.equal(latLonToVector3(-95, 10, 2.25), null);
+  assert.equal(latLonToVector3(10, 185, 2.25), null);
+  assert.equal(latLonToVector3(10, -185, 2.25), null);
+  assert.equal(latLonToVector3(null, null, 2.25), null);
+  assert.equal(latLonToVector3(35.68, 51.38, 0), null);
+  assert.equal(latLonToVector3(35.68, 51.38, -2), null);
+
+  const vec = latLonToVector3(35.6892, 51.389, 2.25);
+  assert.ok(vec instanceof THREE.Vector3);
+  assert.ok(Number.isFinite(vec.x) && Number.isFinite(vec.y) && Number.isFinite(vec.z));
+  assert.ok(Math.abs(vec.length() - 2.25) < 1e-6);
+});
+
+test('initGlobeWebGLSafe handles WebGL context failure and renderer creation errors gracefully', () => {
+  // Case 1: WebGL context probe returns null
+  const noGlResult = initGlobeWebGLSafe({
+    probeContext: () => null,
+  });
+  assert.equal(noGlResult.renderer, null);
+  assert.equal(noGlResult.webglUnavailable, true);
+
+  // Case 2: WebGLRenderer constructor throws GPU error
+  const throwResult = initGlobeWebGLSafe({
+    probeContext: () => ({ gl: {} as WebGLRenderingContext, gpuRenderer: 'NVIDIA RTX' }),
+    createRenderer: () => {
+      throw new Error('Failed to create WebGL context');
+    },
+  });
+  assert.equal(throwResult.renderer, null);
+  assert.equal(throwResult.webglUnavailable, true);
+
+  // Case 3: Renderer created but getContext() returns null
+  let disposedOnNullCtx = 0;
+  const nullCtxResult = initGlobeWebGLSafe({
+    probeContext: () => ({ gl: {} as WebGLRenderingContext, gpuRenderer: 'SwiftShader' }),
+    createRenderer: () => ({
+      getContext: () => null,
+      dispose: () => {
+        disposedOnNullCtx += 1;
+      },
+    }),
+  });
+  assert.equal(nullCtxResult.renderer, null);
+  assert.equal(nullCtxResult.webglUnavailable, true);
+  assert.equal(nullCtxResult.isLowPowerOrSoftwareGl, true);
+  assert.equal(disposedOnNullCtx, 1);
+
+  // Case 4: Successful hardware WebGL renderer creation
+  const mockRenderer = {
+    getContext: () => ({}),
+    dispose: () => {},
+  };
+  const okResult = initGlobeWebGLSafe({
+    probeContext: () => ({ gl: {} as WebGLRenderingContext, gpuRenderer: 'Apple M3 Pro' }),
+    createRenderer: () => mockRenderer,
+    hardwareConcurrency: 8,
+  });
+  assert.equal(okResult.renderer, mockRenderer);
+  assert.equal(okResult.webglUnavailable, false);
+  assert.equal(okResult.isLowPowerOrSoftwareGl, false);
+});
+
+test('createGlobeResourceManager disposes all Three.js resources, ResizeObserver, and timers without double-freeing shared resources', () => {
+  const manager = createGlobeResourceManager();
+
+  let sharedGeomDisposeCount = 0;
+  let sharedMatDisposeCount = 0;
+  let sharedTexDisposeCount = 0;
+  let rtDisposeCount = 0;
+  let controlsDisposeCount = 0;
+  let rendererDisposeCount = 0;
+  let resizeDisconnectedCount = 0;
+  let cancelledFrameId: number | null = null;
+
+  const sharedGeom = manager.trackGeometry({
+    dispose: () => {
+      sharedGeomDisposeCount += 1;
+    },
+  });
+  // Register the same geometry a second time to test deduplication
+  manager.trackGeometry(sharedGeom);
+
+  const sharedTex = manager.trackTexture({
+    dispose: () => {
+      sharedTexDisposeCount += 1;
+    },
+  });
+  const sharedMat = manager.trackMaterial({
+    map: sharedTex,
+    dispose: () => {
+      sharedMatDisposeCount += 1;
+    },
+  });
+  manager.trackMaterial(sharedMat);
+
+  manager.trackRenderTarget({
+    dispose: () => {
+      rtDisposeCount += 1;
+    },
+  });
+
+  // Also test collectFromScene with a real Three.js Scene containing a shared geometry
+  const scene = new THREE.Scene();
+  const realGeom = new THREE.BoxGeometry(1, 1, 1);
+  let realGeomDisposed = 0;
+  const origDispose = realGeom.dispose.bind(realGeom);
+  realGeom.dispose = () => {
+    realGeomDisposed += 1;
+    origDispose();
+  };
+  const realMat = new THREE.MeshBasicMaterial();
+  const mesh1 = new THREE.Mesh(realGeom, realMat);
+  const mesh2 = new THREE.Mesh(realGeom, realMat);
+  scene.add(mesh1);
+  scene.add(mesh2);
+
+  manager.collectFromScene(scene);
+  manager.disposeAll({
+    animationFrameId: 42,
+    cancelFrame: id => {
+      cancelledFrameId = id;
+    },
+    resizeObserver: {
+      disconnect: () => {
+        resizeDisconnectedCount += 1;
+      },
+    },
+    controls: {
+      dispose: () => {
+        controlsDisposeCount += 1;
+      },
+    },
+    renderer: {
+      dispose: () => {
+        rendererDisposeCount += 1;
+      },
+    },
+  });
+
+  // Calling disposeAll a second time must not re-dispose already freed resources
+  manager.disposeAll({
+    controls: {
+      dispose: () => {
+        controlsDisposeCount += 1;
+      },
+    },
+  });
+
+  assert.equal(manager.isDisposed, true);
+  assert.equal(sharedGeomDisposeCount, 1);
+  assert.equal(sharedMatDisposeCount, 1);
+  assert.equal(sharedTexDisposeCount, 1);
+  assert.equal(rtDisposeCount, 1);
+  assert.equal(realGeomDisposed, 1);
+  assert.equal(controlsDisposeCount, 1);
+  assert.equal(rendererDisposeCount, 1);
+  assert.equal(resizeDisconnectedCount, 1);
+  assert.equal(cancelledFrameId, 42);
+});
+
+
 
 

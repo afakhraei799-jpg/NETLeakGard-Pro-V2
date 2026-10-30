@@ -67,6 +67,115 @@ export function formatTestStatusLabelFa(status: TestStatus | string | undefined 
 }
 
 /**
+ * Validates that geographic coordinates are finite numbers within valid Earth bounds:
+ * latitude in [-90, 90] and longitude in [-180, 180].
+ */
+export function isValidGeoCoordinate(lat: unknown, lon: unknown): lat is number {
+  return (
+    typeof lat === 'number' &&
+    typeof lon === 'number' &&
+    Number.isFinite(lat) &&
+    Number.isFinite(lon) &&
+    lat >= -90 &&
+    lat <= 90 &&
+    lon >= -180 &&
+    lon <= 180
+  );
+}
+
+export type GlobeVisualCategory = 'pass' | 'leak' | 'error' | 'inconclusive';
+
+export interface GlobeVisualStateInfo {
+  visualCategory: GlobeVisualCategory;
+  isLeak: boolean;
+  isError: boolean;
+  isPass: boolean;
+  badgeTextFa: string;
+  badgeTextEn: string;
+}
+
+/**
+ * Strictly separates PASS, LEAK_DETECTED, ERROR, and inconclusive states for Globe3D.
+ * - Never treats ERROR as a confirmed leak.
+ * - Only allows PASS when overallStatus === 'PASS' AND ipDetails has a verified PASS status and non-empty IP.
+ */
+export function resolveGlobeVisualStatus(
+  overallStatus: TestStatus,
+  ipDetails: Pick<IpDetails, 'status' | 'ip'> | null
+): GlobeVisualStateInfo {
+  if (overallStatus === 'LEAK_DETECTED') {
+    return {
+      visualCategory: 'leak',
+      isLeak: true,
+      isError: false,
+      isPass: false,
+      badgeTextFa: 'اخطار سه بعدی: نشت شبکه در تست‌های اجراشده شناسایی شد',
+      badgeTextEn: '3D ALERT: Network leak detected in executed tests',
+    };
+  }
+
+  if (overallStatus === 'ERROR') {
+    return {
+      visualCategory: 'error',
+      isLeak: false,
+      isError: true,
+      isPass: false,
+      badgeTextFa: 'خطا در اجرای تست؛ نتیجه قابل تأیید نیست',
+      badgeTextEn: 'Test execution error; result cannot be verified',
+    };
+  }
+
+  const hasValidIpEvidence =
+    ipDetails !== null &&
+    ipDetails.status === 'PASS' &&
+    typeof ipDetails.ip === 'string' &&
+    ipDetails.ip.trim().length > 0;
+
+  if (overallStatus === 'PASS' && hasValidIpEvidence) {
+    return {
+      visualCategory: 'pass',
+      isLeak: false,
+      isError: false,
+      isPass: true,
+      badgeTextFa: 'وضعیت سه بعدی: بدون نشت در تست‌های بررسی‌شده (صرفاً در محدوده تست‌های اجراشده)',
+      badgeTextEn: '3D STATUS: No leaks observed in executed probes (limited to tested scope)',
+    };
+  }
+
+  if (overallStatus === 'WARNING') {
+    return {
+      visualCategory: 'inconclusive',
+      isLeak: false,
+      isError: false,
+      isPass: false,
+      badgeTextFa: 'هشدار سه بعدی: ریسک احتمالی در تست‌های اجراشده (بدون اثبات نشت قطعی)',
+      badgeTextEn: '3D WARNING: Potential risk in executed tests (no confirmed leak)',
+    };
+  }
+
+  if (overallStatus === 'TESTING') {
+    return {
+      visualCategory: 'inconclusive',
+      isLeak: false,
+      isError: false,
+      isPass: false,
+      badgeTextFa: 'وضعیت سه بعدی: در حال اجرای تست‌های شبکه... نتیجه هنوز قطعی نیست',
+      badgeTextEn: '3D STATUS: Executing network probes... Result not yet determined',
+    };
+  }
+
+  return {
+    visualCategory: 'inconclusive',
+    isLeak: false,
+    isError: false,
+    isPass: false,
+    badgeTextFa: 'وضعیت سه بعدی: بررسی ناقص یا نیازمند پیکربندی زیرساخت (بدون ادعای امنیت کامل)',
+    badgeTextEn: '3D STATUS: Inconclusive or pending infrastructure setup (no claim of full security)',
+  };
+}
+
+
+/**
  * Determines whether an IP or hostname is RFC1918 private, loopback, link-local, CGNAT, multicast, reserved, unique-local IPv6, or mDNS (.local).
  */
 export function isPrivateOrLocalAddress(address: string): boolean {

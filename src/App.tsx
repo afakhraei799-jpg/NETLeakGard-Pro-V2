@@ -311,7 +311,20 @@ export default function App() {
   const handleRetestPorts = useCallback(async () => {
     const res = await performPortLeakTest();
     setPortLeak(res);
-  }, []);
+    if (ipDetails) {
+      const summary = evaluateOverallSummary({
+        ipDetails,
+        dnsLeak,
+        webRtcLeak,
+        vpnProxy,
+        portLeak: res,
+      });
+      setOverallStatus(summary.overallStatus);
+      setPrivacyScore(summary.privacyScore);
+      setIsScoreCalculable(summary.isScoreCalculable);
+      setScoreReasonsFa(summary.reasonsFa);
+    }
+  }, [ipDetails, dnsLeak, webRtcLeak, vpnProxy]);
 
   const fullReport: FullNetworkTestReport = {
     timestamp: new Date().toLocaleString('fa-IR'),
