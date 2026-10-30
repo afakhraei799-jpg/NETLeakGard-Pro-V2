@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
-import { X, FileText, Download, Code, Table, Check } from 'lucide-react';
-import { FullNetworkTestReport, Language } from '../types/network';
+import { X, FileText, Download, Code, Table } from 'lucide-react';
+import { FullNetworkTestReport, Language, TestStatus } from '../types/network';
 import { translations } from '../i18n/translations';
 import jsPDF from 'jspdf';
 import html2canvas from 'html2canvas';
@@ -12,12 +12,40 @@ interface ExportModalProps {
   lang: Language;
 }
 
+function formatTestStatusFa(status: TestStatus | undefined): string {
+  switch (status) {
+    case 'PASS':
+      return 'موفق (بدون نشت مشاهده‌شده)';
+    case 'LEAK_DETECTED':
+      return 'نشت شناسایی شد (LEAK_DETECTED)';
+    case 'WARNING':
+      return 'هشدار (WARNING)';
+    case 'NOT_CONFIGURED':
+      return 'پیکربندی نشده (NOT_CONFIGURED)';
+    case 'INCONCLUSIVE':
+      return 'نامشخص / بدون شواهد کافی (INCONCLUSIVE)';
+    case 'UNSUPPORTED':
+      return 'عدم پشتیبانی (UNSUPPORTED)';
+    case 'ERROR':
+      return 'خطا در اجرای تست (ERROR)';
+    default:
+      return 'نامشخص';
+  }
+}
+
 export const ExportModal: React.FC<ExportModalProps> = ({ isOpen, onClose, report, lang }) => {
   const [isExportingPdf, setIsExportingPdf] = useState(false);
   const t = translations[lang];
   const isFa = lang === 'fa';
 
   if (!isOpen || !report) return null;
+
+  const scoreLabel =
+    report.isScoreCalculable && report.privacyScore !== null
+      ? `${report.privacyScore} / 100`
+      : isFa
+      ? 'امتیاز قابل محاسبه نیست (شواهد ناکافی)'
+      : 'Score Not Calculable (Incomplete Evidence)';
 
   // Export JSON
   const handleExportJson = () => {
@@ -35,17 +63,20 @@ export const ExportModal: React.FC<ExportModalProps> = ({ isOpen, onClose, repor
     const rows = [
       ['پارامتر / Parameter', 'مقدار / Value'],
       ['زمان آزمایش / Timestamp', report.timestamp],
-      ['آدرس IP عمومی / Public IP', report.ipDetails?.ip || 'N/A'],
-      ['کشور / Country', report.ipDetails?.countryName || 'N/A'],
-      ['شهر / City', report.ipDetails?.city || 'N/A'],
-      ['سرویس دهنده / ISP', report.ipDetails?.isp || 'N/A'],
-      ['وضعیت نشت DNS / DNS Leak', report.dnsLeak?.isLeaking ? 'نشت شناسایی شد' : 'موفق (امن)'],
-      ['وضعیت نشت WebRTC / WebRTC Leak', report.webRtcLeak?.isLeakingRealIp ? 'نشت شناسایی شد' : 'موفق (امن)'],
-      ['وضعیت VPN / VPN Status', report.vpnProxy?.isDatacenterIp ? 'VPN فعال' : 'اتصال مستقیم'],
-      ['امتیاز کلی امنیت / Privacy Score', `${report.privacyScore}/100`],
+      ['وضعیت کلی / Overall Status', report.overallStatus],
+      ['آدرس IP مشاهده‌شده کلاینت / Client Public IP', report.ipDetails?.clientObservedIp || 'نامشخص'],
+      ['آدرس IP مشاهده‌شده سرور / Server Observed IP', report.ipDetails?.serverObservedIp || 'نامشخص'],
+      ['کشور (تخمین GeoIP) / Country', report.ipDetails?.countryName || 'نامشخص'],
+      ['شهر (تخمین GeoIP) / City', report.ipDetails?.city || 'نامشخص'],
+      ['سرویس دهنده / ISP', report.ipDetails?.isp || 'نامشخص'],
+      ['وضعیت تست نشت DNS / DNS Leak Status', formatTestStatusFa(report.dnsLeak?.status)],
+      ['وضعیت تست نشت WebRTC / WebRTC Leak Status', formatTestStatusFa(report.webRtcLeak?.status)],
+      ['ارزیابی احتمالی VPN / VPN Assessment', report.vpnProxy?.messageFa || 'نامشخص'],
+      ['میانگین تاخیر HTTP RTT / HTTP RTT (ms)', report.metrics?.pingMs !== null && report.metrics?.pingMs !== undefined ? String(report.metrics.pingMs) : 'نامشخص'],
+      ['امتیاز کلی امنیت / Privacy Score', scoreLabel],
     ];
 
-    const csvContent = 'data:text/csv;charset=utf-8,\uFEFF' + rows.map(e => e.join(',')).join('\n');
+    const csvContent = 'data:text/csv;charset=utf-8,\uFEFF' + rows.map(e => e.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(',')).join('\n');
     const encodedUri = encodeURI(csvContent);
     const link = document.createElement('a');
     link.setAttribute('href', encodedUri);
@@ -95,14 +126,14 @@ export const ExportModal: React.FC<ExportModalProps> = ({ isOpen, onClose, repor
             <div>
               <h3 className="text-lg font-bold text-white">{t.exportReport}</h3>
               <p className="text-xs text-slate-400">
-                {isFa ? 'دریافت نسخه چاپی PDF یا فایل داده‌های خام آزمایش' : 'Download PDF report or raw dataset'}
+                {isFa ? 'دریافت نسخه چاپی PDF یا فایل داده‌های خام آزمایش (شامل تمام شواهد و محدودیت‌ها)' : 'Download PDF report or raw dataset with full evidence & limitations'}
               </p>
             </div>
           </div>
 
           <button
             onClick={onClose}
-            className="p-2 text-slate-400 hover:text-white bg-slate-800 hover:bg-slate-700 rounded-xl transition-colors"
+            className="p-2 text-slate-400 hover:text-white bg-slate-800 hover:bg-slate-700 rounded-xl transition-colors cursor-pointer"
           >
             <X className="w-5 h-5" />
           </button>
@@ -114,7 +145,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({ isOpen, onClose, repor
           <button
             onClick={handleExportPdf}
             disabled={isExportingPdf}
-            className="flex flex-col items-center justify-center p-5 bg-gradient-to-b from-cyan-950/80 to-slate-950 border border-cyan-800/60 hover:border-cyan-500 rounded-2xl text-center transition-colors group"
+            className="flex flex-col items-center justify-center p-5 bg-gradient-to-b from-cyan-950/80 to-slate-950 border border-cyan-800/60 hover:border-cyan-500 rounded-2xl text-center transition-colors group cursor-pointer"
           >
             <Download className="w-6 h-6 text-cyan-400 mb-2 group-hover:scale-110 transition-transform" />
             <span className="text-xs font-bold text-white">{t.exportPdf}</span>
@@ -123,7 +154,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({ isOpen, onClose, repor
 
           <button
             onClick={handleExportJson}
-            className="flex flex-col items-center justify-center p-5 bg-slate-950 border border-slate-800 hover:border-slate-700 rounded-2xl text-center transition-colors group"
+            className="flex flex-col items-center justify-center p-5 bg-slate-950 border border-slate-800 hover:border-slate-700 rounded-2xl text-center transition-colors group cursor-pointer"
           >
             <Code className="w-6 h-6 text-emerald-400 mb-2 group-hover:scale-110 transition-transform" />
             <span className="text-xs font-bold text-white">{t.exportJson}</span>
@@ -132,7 +163,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({ isOpen, onClose, repor
 
           <button
             onClick={handleExportCsv}
-            className="flex flex-col items-center justify-center p-5 bg-slate-950 border border-slate-800 hover:border-slate-700 rounded-2xl text-center transition-colors group"
+            className="flex flex-col items-center justify-center p-5 bg-slate-950 border border-slate-800 hover:border-slate-700 rounded-2xl text-center transition-colors group cursor-pointer"
           >
             <Table className="w-6 h-6 text-purple-400 mb-2 group-hover:scale-110 transition-transform" />
             <span className="text-xs font-bold text-white">{t.exportCsv}</span>
@@ -144,32 +175,36 @@ export const ExportModal: React.FC<ExportModalProps> = ({ isOpen, onClose, repor
         {/* Printable Preview Area for html2canvas PDF capture */}
         <div id="pdf-export-content" className="bg-slate-950 p-6 rounded-2xl border border-slate-800 text-xs space-y-4">
           <div className="border-b border-slate-800 pb-3 flex items-center justify-between">
-            <h4 className="font-bold text-sm text-cyan-400">{t.brandName} - گزارش ارزیابی امنیتی</h4>
+            <h4 className="font-bold text-sm text-cyan-400">{t.brandName} - گزارش ارزیابی شواهد شبکه</h4>
             <span className="text-slate-400 font-mono text-[10px]">{report.timestamp}</span>
           </div>
 
           <div className="grid grid-cols-2 gap-3 font-mono">
             <div>
-              <span className="text-slate-400 block">IP عمومی:</span>
-              <span className="text-white font-bold">{report.ipDetails?.ip}</span>
+              <span className="text-slate-400 block">IP کلاینت / سرور:</span>
+              <span className="text-white font-bold">
+                {report.ipDetails?.clientObservedIp || 'نامشخص'} / {report.ipDetails?.serverObservedIp || 'نامشخص'}
+              </span>
             </div>
             <div>
-              <span className="text-slate-400 block">کشور و ISP:</span>
-              <span className="text-white font-bold">{report.ipDetails?.countryName} ({report.ipDetails?.isp})</span>
+              <span className="text-slate-400 block">کشور و ISP (تخمین GeoIP):</span>
+              <span className="text-white font-bold">
+                {report.ipDetails?.countryName || 'نامشخص'} ({report.ipDetails?.isp || 'نامشخص'})
+              </span>
             </div>
             <div>
-              <span className="text-slate-400 block">آزمایش DNS:</span>
-              <span className="text-emerald-400 font-bold">{report.dnsLeak?.isLeaking ? 'نشت شناسایی شد' : 'موفق (امن)'}</span>
+              <span className="text-slate-400 block">وضعیت تست DNS:</span>
+              <span className="text-amber-300 font-bold">{formatTestStatusFa(report.dnsLeak?.status)}</span>
             </div>
             <div>
-              <span className="text-slate-400 block">آزمایش WebRTC:</span>
-              <span className="text-emerald-400 font-bold">{report.webRtcLeak?.isLeakingRealIp ? 'نشت شناسایی شد' : 'موفق (محافظت‌شده)'}</span>
+              <span className="text-slate-400 block">وضعیت تست WebRTC:</span>
+              <span className="text-cyan-300 font-bold">{formatTestStatusFa(report.webRtcLeak?.status)}</span>
             </div>
           </div>
 
           <div className="pt-2 border-t border-slate-800 flex items-center justify-between font-bold">
             <span className="text-slate-300">امتیاز نهایی حریم خصوصی:</span>
-            <span className="text-lg font-mono text-cyan-300">{report.privacyScore} / 100</span>
+            <span className="text-sm font-mono text-cyan-300">{scoreLabel}</span>
           </div>
         </div>
 

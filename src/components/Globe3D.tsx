@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { IpDetails, DnsResolver, Language, TestStatus } from '../types/network';
-import { Shield, Globe as GlobeIcon, Radio, Maximize2, Minimize2, Compass, Sparkles, AlertTriangle, ShieldCheck } from 'lucide-react';
+import { Shield, Globe as GlobeIcon, Radio, Maximize2, Minimize2, Compass, AlertTriangle, ShieldCheck, HelpCircle } from 'lucide-react';
 
 interface Globe3DProps {
   ipDetails: IpDetails | null;
@@ -23,18 +23,21 @@ function latLonToVector3(lat: number, lon: number, radius: number): THREE.Vector
 }
 
 // Generate procedural Earth texture canvas
-function createProceduralEarthTexture(isLeak: boolean): THREE.CanvasTexture {
+function createProceduralEarthTexture(visualState: 'leak' | 'pass' | 'inconclusive'): THREE.CanvasTexture {
   const canvas = document.createElement('canvas');
-  canvas.width = 2048;
-  canvas.height = 1024;
+  canvas.width = 1024;
+  canvas.height = 512;
   const ctx = canvas.getContext('2d')!;
 
-  // Deep Ocean Gradient (Reddish dark if leak, Cyber blue/dark if safe)
   const gradient = ctx.createLinearGradient(0, 0, 0, canvas.height);
-  if (isLeak) {
+  if (visualState === 'leak') {
     gradient.addColorStop(0, '#1a0505');
     gradient.addColorStop(0.5, '#3b0707');
     gradient.addColorStop(1, '#0f0202');
+  } else if (visualState === 'inconclusive') {
+    gradient.addColorStop(0, '#171305');
+    gradient.addColorStop(0.5, '#292007');
+    gradient.addColorStop(1, '#0c0a03');
   } else {
     gradient.addColorStop(0, '#040914');
     gradient.addColorStop(0.5, '#07162c');
@@ -44,7 +47,7 @@ function createProceduralEarthTexture(isLeak: boolean): THREE.CanvasTexture {
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
   // Cyber Grid Lines
-  ctx.strokeStyle = isLeak ? '#501111' : '#0e2544';
+  ctx.strokeStyle = visualState === 'leak' ? '#501111' : visualState === 'inconclusive' ? '#42330d' : '#0e2544';
   ctx.lineWidth = 1;
   for (let x = 0; x < canvas.width; x += 32) {
     ctx.beginPath();
@@ -59,24 +62,16 @@ function createProceduralEarthTexture(isLeak: boolean): THREE.CanvasTexture {
     ctx.stroke();
   }
 
-  // Continent Landmass Dot Clusters
-  ctx.fillStyle = isLeak ? '#801818' : '#0f4068';
-  for (let i = 0; i < 8000; i++) {
-    const rx = Math.random() * canvas.width;
-    const ry = Math.random() * canvas.height;
-    const size = Math.random() * 6 + 1.5;
+  // Deterministic pseudo-random continent dot grid so visual texture is consistent
+  ctx.fillStyle = visualState === 'leak' ? '#801818' : visualState === 'inconclusive' ? '#785c12' : '#0f4068';
+  for (let i = 0; i < 2500; i++) {
+    const seed = (i * 9301 + 49297) % 233280;
+    const seed2 = (i * 49297 + 9301) % 233280;
+    const rx = (seed / 233280) * canvas.width;
+    const ry = (seed2 / 233280) * canvas.height;
+    const size = ((i % 5) + 1.5);
     ctx.beginPath();
     ctx.arc(rx, ry, size, 0, Math.PI * 2);
-    ctx.fill();
-  }
-
-  // Network Nodes
-  ctx.fillStyle = isLeak ? '#ef4444' : '#06b6d4';
-  for (let i = 0; i < 300; i++) {
-    const rx = Math.random() * canvas.width;
-    const ry = Math.random() * canvas.height;
-    ctx.beginPath();
-    ctx.arc(rx, ry, 2.5, 0, Math.PI * 2);
     ctx.fill();
   }
 
@@ -85,13 +80,22 @@ function createProceduralEarthTexture(isLeak: boolean): THREE.CanvasTexture {
   return texture;
 }
 
-export const Globe3D: React.FC<Globe3DProps> = ({ ipDetails, dnsResolvers, lang, overallStatus }) => {
+export const Globe3D: React.FC<Globe3DProps> = ({ ipDetails, lang, overallStatus }) => {
   const mountRef = useRef<HTMLDivElement>(null);
   const [isExpanded, setIsExpanded] = useState(false);
   const [mode, setMode] = useState<'globe' | 'shield'>('globe');
   const isFa = lang === 'fa';
 
-  const isLeak = overallStatus === 'LEAK_DETECTED' || overallStatus === 'WARNING';
+  const isLeak = overallStatus === 'LEAK_DETECTED' || overallStatus === 'ERROR';
+  const isPass = overallStatus === 'PASS';
+  const visualState: 'leak' | 'pass' | 'inconclusive' = isLeak ? 'leak' : isPass ? 'pass' : 'inconclusive';
+
+  const hasValidCoordinates =
+    ipDetails !== null &&
+    typeof ipDetails.lat === 'number' &&
+    !Number.isNaN(ipDetails.lat) &&
+    typeof ipDetails.lon === 'number' &&
+    !Number.isNaN(ipDetails.lon);
 
   useEffect(() => {
     const container = mountRef.current;
@@ -107,17 +111,17 @@ export const Globe3D: React.FC<Globe3DProps> = ({ ipDetails, dnsResolvers, lang,
         const gpu = String(gl.getParameter(param));
         gl.getExtension('WEBGL_lose_context')?.loseContext();
         return /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
-      } catch (e) {
+      } catch {
         return false;
       }
     })();
 
     const width = container.clientWidth || 800;
-    const height = container.clientHeight || 450;
+    const height = container.clientHeight || 420;
 
-    // Colors
-    const primaryColorHex = isLeak ? 0xef4444 : 0x10b981; // Red Alarm vs Green Secure
-    const accentColorHex = isLeak ? 0xf87171 : 0x34d399;
+    // Colors based on honest 3-state model
+    const primaryColorHex = isLeak ? 0xef4444 : isPass ? 0x10b981 : 0xf59e0b;
+    const accentColorHex = isLeak ? 0xf87171 : isPass ? 0x34d399 : 0xfbbf24;
 
     // Scene
     const scene = new THREE.Scene();
@@ -151,13 +155,15 @@ export const Globe3D: React.FC<Globe3DProps> = ({ ipDetails, dnsResolvers, lang,
     controls.rotateSpeed = 0.8;
     controls.minDistance = 3.5;
     controls.maxDistance = 14;
-    controls.autoRotate = true;
-    controls.autoRotateSpeed = isLeak ? 1.8 : 0.8; // Faster rotation when in leak alarm mode
+    controls.autoRotate = !isSoftwareGl;
+    controls.autoRotateSpeed = isLeak ? 1.6 : 0.7;
 
     // Environment Lighting
-    const pmremGenerator = new THREE.PMREMGenerator(renderer);
-    scene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
-    pmremGenerator.dispose();
+    if (!isSoftwareGl) {
+      const pmremGenerator = new THREE.PMREMGenerator(renderer);
+      scene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
+      pmremGenerator.dispose();
+    }
 
     // Lighting Rig
     const keyLight = new THREE.DirectionalLight(primaryColorHex, 3.5);
@@ -175,7 +181,7 @@ export const Globe3D: React.FC<Globe3DProps> = ({ ipDetails, dnsResolvers, lang,
     const mainGroup = new THREE.Group();
     scene.add(mainGroup);
 
-    // 3D Alarm Pulse Rings (Pulsing Orbiting Torus Geometry)
+    // 3D Status Ring
     const alarmRingGeom = new THREE.TorusGeometry(2.6, 0.03, 16, 64);
     const alarmRingMat = new THREE.MeshPhysicalMaterial({
       color: primaryColorHex,
@@ -189,11 +195,11 @@ export const Globe3D: React.FC<Globe3DProps> = ({ ipDetails, dnsResolvers, lang,
     mainGroup.add(alarmRingMesh);
 
     if (mode === 'globe') {
-      // BUILD 3D EARTH GLOBE
       const globeRadius = 2.2;
-      const earthGeometry = new THREE.SphereGeometry(globeRadius, 64, 64);
-      const earthTexture = createProceduralEarthTexture(isLeak);
-      
+      const segments = isSoftwareGl ? 24 : 48;
+      const earthGeometry = new THREE.SphereGeometry(globeRadius, segments, segments);
+      const earthTexture = createProceduralEarthTexture(visualState);
+
       const earthMaterial = new THREE.MeshPhysicalMaterial({
         map: earthTexture,
         roughness: 0.35,
@@ -207,8 +213,7 @@ export const Globe3D: React.FC<Globe3DProps> = ({ ipDetails, dnsResolvers, lang,
       const earthMesh = new THREE.Mesh(earthGeometry, earthMaterial);
       mainGroup.add(earthMesh);
 
-      // Atmosphere Glow Layer (Pulsing Red or Green)
-      const atmosphereGeom = new THREE.SphereGeometry(globeRadius * 1.08, 48, 48);
+      const atmosphereGeom = new THREE.SphereGeometry(globeRadius * 1.08, segments, segments);
       const atmosphereMat = new THREE.MeshBasicMaterial({
         color: primaryColorHex,
         transparent: true,
@@ -218,66 +223,39 @@ export const Globe3D: React.FC<Globe3DProps> = ({ ipDetails, dnsResolvers, lang,
       const atmosphereMesh = new THREE.Mesh(atmosphereGeom, atmosphereMat);
       mainGroup.add(atmosphereMesh);
 
-      // Particle Cloud
-      const particleCount = 250;
-      const particleGeom = new THREE.BufferGeometry();
-      const particlePositions = new Float32Array(particleCount * 3);
-      for (let i = 0; i < particleCount * 3; i += 3) {
-        const u = Math.random();
-        const v = Math.random();
-        const theta = u * 2.0 * Math.PI;
-        const phi = Math.acos(2.0 * v - 1.0);
-        const r = globeRadius + 0.3 + Math.random() * 0.8;
-        particlePositions[i] = r * Math.sin(phi) * Math.cos(theta);
-        particlePositions[i + 1] = r * Math.sin(phi) * Math.sin(theta);
-        particlePositions[i + 2] = r * Math.cos(phi);
+      // Client Location Pin — ONLY rendered when real GeoIP coordinates exist (never defaults to Tehran!)
+      if (hasValidCoordinates && ipDetails?.lat !== null && ipDetails?.lon !== null && ipDetails) {
+        const clientPos = latLonToVector3(ipDetails.lat, ipDetails.lon, globeRadius + 0.05);
+        const clientPinGroup = new THREE.Group();
+
+        const pinStemGeom = new THREE.CylinderGeometry(0.025, 0.025, 0.38, 12);
+        const pinStemMat = new THREE.MeshPhysicalMaterial({
+          color: primaryColorHex,
+          emissive: primaryColorHex,
+          emissiveIntensity: 0.5,
+          metalness: 0.9,
+        });
+        const pinStem = new THREE.Mesh(pinStemGeom, pinStemMat);
+        pinStem.position.y = 0.19;
+
+        const pinHeadGeom = new THREE.SphereGeometry(0.09, 12, 12);
+        const pinHeadMat = new THREE.MeshPhysicalMaterial({
+          color: primaryColorHex,
+          emissive: primaryColorHex,
+          emissiveIntensity: 0.8,
+          roughness: 0.1,
+        });
+        const pinHead = new THREE.Mesh(pinHeadGeom, pinHeadMat);
+        pinHead.position.y = 0.38;
+
+        clientPinGroup.add(pinStem);
+        clientPinGroup.add(pinHead);
+        clientPinGroup.position.copy(clientPos);
+        clientPinGroup.lookAt(new THREE.Vector3(0, 0, 0));
+        clientPinGroup.rotateX(Math.PI / 2);
+        mainGroup.add(clientPinGroup);
       }
-      particleGeom.setAttribute('position', new THREE.BufferAttribute(particlePositions, 3));
-      const particleMat = new THREE.PointsMaterial({
-        color: primaryColorHex,
-        size: 0.045,
-        transparent: true,
-        opacity: 0.85,
-      });
-      const particlePoints = new THREE.Points(particleGeom, particleMat);
-      mainGroup.add(particlePoints);
-
-      // Client Location Pin
-      const clientLat = ipDetails?.lat || 35.6892;
-      const clientLon = ipDetails?.lon || 51.3890;
-      const clientPos = latLonToVector3(clientLat, clientLon, globeRadius + 0.05);
-
-      const clientPinGroup = new THREE.Group();
-      
-      const pinStemGeom = new THREE.CylinderGeometry(0.025, 0.025, 0.38, 16);
-      const pinStemMat = new THREE.MeshPhysicalMaterial({
-        color: primaryColorHex,
-        emissive: primaryColorHex,
-        emissiveIntensity: 0.5,
-        metalness: 0.9
-      });
-      const pinStem = new THREE.Mesh(pinStemGeom, pinStemMat);
-      pinStem.position.y = 0.19;
-
-      const pinHeadGeom = new THREE.SphereGeometry(0.09, 16, 16);
-      const pinHeadMat = new THREE.MeshPhysicalMaterial({
-        color: primaryColorHex,
-        emissive: primaryColorHex,
-        emissiveIntensity: 0.8,
-        roughness: 0.1,
-      });
-      const pinHead = new THREE.Mesh(pinHeadGeom, pinHeadMat);
-      pinHead.position.y = 0.38;
-
-      clientPinGroup.add(pinStem);
-      clientPinGroup.add(pinHead);
-      clientPinGroup.position.copy(clientPos);
-      clientPinGroup.lookAt(new THREE.Vector3(0, 0, 0));
-      clientPinGroup.rotateX(Math.PI / 2);
-      mainGroup.add(clientPinGroup);
-
     } else {
-      // BUILD 3D HOLOGRAPHIC SECURITY SHIELD (Red Warning Alarm or Green Secure Shield)
       const shieldGroup = new THREE.Group();
 
       const shieldShape = new THREE.Shape();
@@ -289,7 +267,7 @@ export const Globe3D: React.FC<Globe3DProps> = ({ ipDetails, dnsResolvers, lang,
       shieldShape.lineTo(-1.4, 1.2);
       shieldShape.closePath();
 
-      const extrudeSettings = { depth: 0.18, bevelEnabled: true, bevelSegments: 5, steps: 1, bevelSize: 0.08, bevelThickness: 0.08 };
+      const extrudeSettings = { depth: 0.18, bevelEnabled: true, bevelSegments: 3, steps: 1, bevelSize: 0.08, bevelThickness: 0.08 };
       const shieldGeom = new THREE.ExtrudeGeometry(shieldShape, extrudeSettings);
       const shieldMat = new THREE.MeshPhysicalMaterial({
         color: primaryColorHex,
@@ -303,13 +281,12 @@ export const Globe3D: React.FC<Globe3DProps> = ({ ipDetails, dnsResolvers, lang,
       shieldMesh.position.z = -0.08;
       shieldGroup.add(shieldMesh);
 
-      // Rotating Outer Ring
-      const ringGeom = new THREE.TorusGeometry(2.1, 0.04, 16, 64);
+      const ringGeom = new THREE.TorusGeometry(2.1, 0.04, 16, 48);
       const ringMat = new THREE.MeshPhysicalMaterial({
         color: primaryColorHex,
         emissive: primaryColorHex,
         emissiveIntensity: 0.7,
-        metalness: 0.95
+        metalness: 0.95,
       });
       const ringMesh = new THREE.Mesh(ringGeom, ringMat);
       ringMesh.position.z = 0;
@@ -318,11 +295,11 @@ export const Globe3D: React.FC<Globe3DProps> = ({ ipDetails, dnsResolvers, lang,
       mainGroup.add(shieldGroup);
     }
 
-    // Animation Loop
-    let animationFrameId: number;
-    let clock = new THREE.Clock();
+    let animationFrameId: number | null = null;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    const clock = new THREE.Clock();
 
-    function animate() {
+    function renderFrame() {
       const delta = clock.getDelta();
       const time = clock.getElapsedTime();
       controls.update();
@@ -330,16 +307,22 @@ export const Globe3D: React.FC<Globe3DProps> = ({ ipDetails, dnsResolvers, lang,
       mainGroup.rotation.y += delta * (isLeak ? 0.4 : 0.18);
       alarmRingMesh.rotation.z += delta * 0.5;
 
-      // Pulsing scale in alarm mode
       if (isLeak) {
         alarmRingMesh.scale.setScalar(1 + Math.sin(time * 6) * 0.08);
       }
 
       renderer.render(scene, camera);
-      animationFrameId = requestAnimationFrame(animate);
+
+      if (isSoftwareGl) {
+        timeoutId = setTimeout(() => {
+          animationFrameId = requestAnimationFrame(renderFrame);
+        }, 250);
+      } else {
+        animationFrameId = requestAnimationFrame(renderFrame);
+      }
     }
 
-    animate();
+    renderFrame();
 
     const handleResize = () => {
       if (!container) return;
@@ -354,37 +337,57 @@ export const Globe3D: React.FC<Globe3DProps> = ({ ipDetails, dnsResolvers, lang,
 
     return () => {
       window.removeEventListener('resize', handleResize);
-      cancelAnimationFrame(animationFrameId);
+      if (animationFrameId !== null) cancelAnimationFrame(animationFrameId);
+      if (timeoutId !== null) clearTimeout(timeoutId);
       controls.dispose();
       renderer.dispose();
     };
-  }, [ipDetails, mode, overallStatus]);
+  }, [ipDetails, mode, overallStatus, isLeak, isPass, visualState, hasValidCoordinates]);
+
+  const getBadgeText = () => {
+    if (isLeak) {
+      return isFa
+        ? 'اخطار سه بعدی: نشت یا خطا در تست‌های شبکه شناسایی شد'
+        : '3D ALERT: Network Leak or Test Error Detected';
+    }
+    if (isPass) {
+      return isFa
+        ? 'وضعیت سه بعدی: بدون نشت در تست‌های بررسی‌شده (بر پایه شواهد فعلی)'
+        : '3D STATUS: No Leaks Detected in Executed Probes';
+    }
+    return isFa
+      ? 'وضعیت سه بعدی: بررسی ناقص یا نیازمند پیکربندی زیرساخت (بدون ادعای امنیت کامل)'
+      : '3D STATUS: Inconclusive or Pending Infrastructure Setup';
+  };
 
   return (
-    <div className={`relative bg-gradient-to-b ${isLeak ? 'from-rose-950/40 via-slate-950 to-slate-950 border-rose-800/80 shadow-[0_0_40px_rgba(239,68,68,0.2)]' : 'from-slate-900 to-slate-950 border-slate-800 shadow-2xl'} border rounded-3xl overflow-hidden transition-all duration-300 ${isExpanded ? 'h-[620px]' : 'h-[420px]'}`}>
+    <div className={`relative bg-gradient-to-b ${
+      isLeak
+        ? 'from-rose-950/40 via-slate-950 to-slate-950 border-rose-800/80 shadow-[0_0_40px_rgba(239,68,68,0.2)]'
+        : 'from-slate-900 to-slate-950 border-slate-800 shadow-2xl'
+    } border rounded-3xl overflow-hidden transition-all duration-300 ${isExpanded ? 'h-[620px]' : 'h-[420px]'}`}>
       
       {/* WebGL 3D Canvas */}
       <div ref={mountRef} className="w-full h-full cursor-grab active:cursor-grabbing" />
 
-      {/* Dynamic 3D Alert Overlay Banner */}
+      {/* Dynamic 3D Status Overlay Banner */}
       <div className="absolute top-4 right-4 left-4 flex items-center justify-between pointer-events-none z-20">
         
-        {/* Dynamic Status Badge */}
         <div className={`flex items-center gap-2.5 backdrop-blur-md px-4 py-2 rounded-2xl border font-bold text-xs pointer-events-auto shadow-2xl ${
-          isLeak 
-            ? 'bg-rose-950/90 text-rose-200 border-rose-800/80 shadow-rose-900/50 animate-pulse' 
-            : 'bg-emerald-950/90 text-emerald-200 border-emerald-800/80 shadow-emerald-900/50'
+          isLeak
+            ? 'bg-rose-950/90 text-rose-200 border-rose-800/80 shadow-rose-900/50'
+            : isPass
+            ? 'bg-emerald-950/90 text-emerald-200 border-emerald-800/80 shadow-emerald-900/50'
+            : 'bg-amber-950/90 text-amber-200 border-amber-800/80 shadow-amber-900/50'
         }`}>
           {isLeak ? (
-            <AlertTriangle className="w-4 h-4 text-rose-400 animate-bounce" />
+            <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+          ) : isPass ? (
+            <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
           ) : (
-            <ShieldCheck className="w-4 h-4 text-emerald-400" />
+            <HelpCircle className="w-4 h-4 text-amber-400 shrink-0" />
           )}
-          <span>
-            {isLeak 
-              ? (isFa ? 'اخطار سه بعدی: نشت اطلاعات در شبکه شناسایی شد!' : '3D RED ALARM: NETWORK LEAK DETECTED!') 
-              : (isFa ? 'امنیت سه بعدی: اتصال ۱۰۰٪ امن و بدون نشت' : '3D GREEN SECURE: SAFE CONNECTION')}
-          </span>
+          <span>{getBadgeText()}</span>
         </div>
 
         {/* Controls */}
@@ -392,7 +395,7 @@ export const Globe3D: React.FC<Globe3DProps> = ({ ipDetails, dnsResolvers, lang,
           <div className="bg-slate-950/85 backdrop-blur-md p-1 rounded-2xl border border-slate-800 flex items-center gap-1 shadow-lg">
             <button
               onClick={() => setMode('globe')}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold transition-all ${
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold transition-all cursor-pointer ${
                 mode === 'globe' ? 'bg-cyan-500 text-slate-950 shadow-md' : 'text-slate-400 hover:text-white'
               }`}
             >
@@ -402,9 +405,9 @@ export const Globe3D: React.FC<Globe3DProps> = ({ ipDetails, dnsResolvers, lang,
 
             <button
               onClick={() => setMode('shield')}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold transition-all ${
-                mode === 'shield' 
-                  ? (isLeak ? 'bg-rose-500 text-slate-950 shadow-md' : 'bg-emerald-500 text-slate-950 shadow-md') 
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold transition-all cursor-pointer ${
+                mode === 'shield'
+                  ? (isLeak ? 'bg-rose-500 text-slate-950 shadow-md' : isPass ? 'bg-emerald-500 text-slate-950 shadow-md' : 'bg-amber-500 text-slate-950 shadow-md')
                   : 'text-slate-400 hover:text-white'
               }`}
             >
@@ -415,7 +418,7 @@ export const Globe3D: React.FC<Globe3DProps> = ({ ipDetails, dnsResolvers, lang,
 
           <button
             onClick={() => setIsExpanded(!isExpanded)}
-            className="bg-slate-950/85 backdrop-blur-md text-slate-300 hover:text-white p-2 rounded-2xl border border-slate-800 transition-colors shadow-lg"
+            className="bg-slate-950/85 backdrop-blur-md text-slate-300 hover:text-white p-2 rounded-2xl border border-slate-800 transition-colors shadow-lg cursor-pointer"
           >
             {isExpanded ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
           </button>
@@ -423,13 +426,17 @@ export const Globe3D: React.FC<Globe3DProps> = ({ ipDetails, dnsResolvers, lang,
       </div>
 
       {/* Bottom Information Bar */}
-      <div className="absolute bottom-4 right-4 left-4 flex items-center justify-between bg-slate-950/85 backdrop-blur-md px-4 py-2.5 rounded-2xl border border-slate-800 text-xs shadow-xl">
+      <div className="absolute bottom-4 right-4 left-4 flex flex-wrap items-center justify-between gap-2 bg-slate-950/85 backdrop-blur-md px-4 py-2.5 rounded-2xl border border-slate-800 text-xs shadow-xl">
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2">
-            <Radio className={`w-4 h-4 ${isLeak ? 'text-rose-400 animate-ping' : 'text-emerald-400 animate-pulse'}`} />
-            <span className="text-slate-300 font-medium">{isFa ? 'وضعیت پایش سه بعدی:' : '3D Monitor:'}</span>
-            <span className={`font-bold ${isLeak ? 'text-rose-400' : 'text-emerald-400'}`}>
-              {isLeak ? (isFa ? 'هشدار نشت فعال' : 'Active Leak Warning') : (isFa ? 'شبکه کاملاً محافظت‌شده' : 'Fully Protected')}
+            <Radio className={`w-4 h-4 ${isLeak ? 'text-rose-400' : isPass ? 'text-emerald-400' : 'text-amber-400'}`} />
+            <span className="text-slate-300 font-medium">{isFa ? 'مکان پین سه بعدی:' : '3D Pin Location:'}</span>
+            <span className="font-mono font-bold text-slate-200">
+              {hasValidCoordinates && ipDetails
+                ? (isFa
+                    ? `تخمین پایگاه GeoIP (${ipDetails.lat?.toFixed(2)}, ${ipDetails.lon?.toFixed(2)})`
+                    : `GeoIP Estimate (${ipDetails.lat?.toFixed(2)}, ${ipDetails.lon?.toFixed(2)})`)
+                : (isFa ? 'مختصات جغرافیایی نامشخص — پین ترسیم نشد' : 'Coordinates unavailable — No pin plotted')}
             </span>
           </div>
         </div>

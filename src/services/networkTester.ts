@@ -3,491 +3,691 @@ import {
   DnsLeakResult,
   WebRtcLeakResult,
   VpnProxyResult,
-  VpnProtocolDetails,
   OptimalVpnNodeSuggestion,
   EncryptedDnsRecommendation,
   NetworkMetrics,
   AiAuditReport,
-  TestStatus
+  ObservedIpSource,
+  WebRtcCandidate
 } from '../types/network';
+import {
+  isValidIpv4,
+  isValidIpv6,
+  isPrivateOrLocalAddress,
+  parseIceCandidateLine,
+  evaluateWebRtcCandidates,
+  evaluateDnsTestResult,
+  evaluateVpnHeuristic,
+  calculateHttpPingMetrics
+} from '../utils/networkEvaluator';
+
+function generateCryptoRunId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  const bytes = new Uint8Array(16);
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    crypto.getRandomValues(bytes);
+  }
+  return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+}
 
 /**
- * Generates Recommended Unfiltered & Encrypted DoH/DoT DNS Resolvers List
+ * Static reference list of well-known Encrypted DoH resolvers (labeled clearly as reference configuration, not live measurements).
  */
 export function generateEncryptedDnsRecommendations(
-  ipDetails: IpDetails | null
+  _ipDetails: IpDetails | null
 ): EncryptedDnsRecommendation[] {
   return [
     {
       id: 'cloudflare',
-      nameFa: 'کلادفلر بدون فیلتر (Cloudflare Privacy DoH)',
+      nameFa: 'Cloudflare DoH (سرویس مرجع جهانی)',
       provider: 'Cloudflare Inc',
       dohUrl: 'https://cloudflare-dns.com/dns-query',
       primaryIp: '1.1.1.1',
       secondaryIp: '1.0.0.1',
-      estimatedPingMs: 12,
-      unfilteredStatusFa: 'سریع‌ترین DoH جهان، کاملاً بدون فیلتر و بدون ثبت لوگ',
-      featuresFa: ['پشتیبانی از ECH (Encrypted Client Hello)', 'عدم ذخیره IP کاربر (Zero Logs)', 'پاسخگویی سریع Anycast'],
+      estimatedPingMs: null,
+      unfilteredStatusFa: 'پشتیبانی از DNS-over-HTTPS استاندارد (RFC 8484)',
+      featuresFa: ['رمزنگاری ترافیک DNS بین مرورگر و Resolver', 'پشتیبانی از QNAME Minimization'],
+    },
+    {
+      id: 'quad9',
+      nameFa: 'Quad9 DoH (بنیاد غیرانتفاعی سوئیس)',
+      provider: 'Quad9 Foundation',
+      dohUrl: 'https://dns.quad9.net/dns-query',
+      primaryIp: '9.9.9.9',
+      secondaryIp: '149.112.112.112',
+      estimatedPingMs: null,
+      unfilteredStatusFa: 'مسدودسازی دامنه‌های مخرب شناخته‌شده + پشتیبانی از DoH/DoT',
+      featuresFa: ['مستقر در سوئیس', 'پشتیبانی از DNSSEC'],
     },
     {
       id: 'controld',
-      nameFa: 'کنترل دی رفع تحریم توسعه‌دهندگان (Control D Unfiltered)',
+      nameFa: 'Control D Unfiltered DoH',
       provider: 'Control D Inc',
       dohUrl: 'https://freedns.controld.com/p0',
       primaryIp: '76.76.2.0',
       secondaryIp: '76.76.10.0',
-      estimatedPingMs: 18,
-      unfilteredStatusFa: 'بدون فیلتر + رفع تحریم‌های نرم‌افزاری و برنامه‌نویسان',
-      featuresFa: ['دور زدن تحریم‌های Docker/Google Cloud/NPM', 'کانال رمزنگاری‌شده DoH/DoT', 'سرعت بالا'],
+      estimatedPingMs: null,
+      unfilteredStatusFa: 'سرور DoH بدون فیلتر',
+      featuresFa: ['پشتیبانی از DoH و DoT'],
     },
     {
-      id: 'quad9',
-      nameFa: 'کواد ۹ ضد بدافزار سوئیس (Quad9 Secure DoH)',
-      provider: 'Quad9 Foundation (Switzerland)',
-      dohUrl: 'https://dns.quad9.net/dns-query',
-      primaryIp: '9.9.9.9',
-      secondaryIp: '149.112.112.112',
-      estimatedPingMs: 22,
-      unfilteredStatusFa: 'سوئیس (حریم خصوصی GDPR + مسدودسازی فیشینگ و بدافزار)',
-      featuresFa: ['مقر در سوئیس خارج از قوانین جاسوسی', 'فیلتر خودکار دامنه‌های مخرب و فیشینگ', 'DoH / DoT / DoQ'],
-    },
-    {
-      id: 'shecan',
-      nameFa: 'شکن تحریم‌شکن تخصصی (Shecan Anti-Sanction)',
-      provider: 'Shecan DoH Project',
-      dohUrl: 'https://doh.shecan.ir/dns-query',
-      primaryIp: '178.22.122.100',
-      secondaryIp: '185.51.200.2',
-      estimatedPingMs: 15,
-      unfilteredStatusFa: 'رفع تحریم‌های بین‌المللی علیه کاربران ایرانی',
-      featuresFa: ['دسترس‌پذیری کامل به سرویس‌های تحریم‌شده آندروید/گوگل/مایکروسافت', 'کانال امن DoH'],
+      id: 'google',
+      nameFa: 'Google Public DNS DoH',
+      provider: 'Google LLC',
+      dohUrl: 'https://dns.google/dns-query',
+      primaryIp: '8.8.8.8',
+      secondaryIp: '8.8.4.4',
+      estimatedPingMs: null,
+      unfilteredStatusFa: 'پایداری بالا در شبکه Anycast جهانی + DNSSEC',
+      featuresFa: ['پشتیبانی از RFC 8484 DoH', 'پشتیبانی از DoT'],
     },
   ];
 }
 
 /**
- * Generates Smart Geographically Nearest & Safest VPN Server Node Recommendation
+ * Generates Heuristic Regional VPN Node Suggestion (explicitly labeled as heuristic, without fake ping guarantees).
  */
 export function generateOptimalVpnNodeSuggestion(
   ipDetails: IpDetails | null,
-  currentPingMs: number = 35
+  _currentPingMs: number | null = null
 ): OptimalVpnNodeSuggestion {
-  const countryCode = (ipDetails?.countryCode || 'IR').toUpperCase();
+  const countryCode = (ipDetails?.countryCode || '').toUpperCase();
 
   if (['IR', 'AE', 'TR', 'QA', 'KW', 'OM', 'IQ', 'SA'].includes(countryCode)) {
     return {
-      recommendedCountryNameFa: 'آلمان (Germany)',
+      recommendedCountryNameFa: 'آلمان (Germany - پیشنهاد جغرافیایی)',
       recommendedCountryCode: 'DE',
-      recommendedCityFa: 'فرانکفورت (Frankfurt)',
-      estimatedPingMs: Math.min(38, Math.max(28, currentPingMs - 5)),
-      privacyRatingFa: 'عالی (قوانین حریم خصوصی GDPR)',
-      recommendationReasonFa: 'آلمان دارای کوتاه ترین مسیریابی فیبر بین‌المللی با پهنای باند بالا به خاورمیانه، قوانین سخت‌گیرانه عدم ثبت داده (No-Logs) و کمترین تاخیر تاخیر شبکه می‌باشد.',
-      recommendedProtocolsFa: ['WireGuard (UDP)', 'VLESS / TLS Camouflage'],
-    };
-  }
-
-  if (['DE', 'FR', 'GB', 'NL', 'CH', 'SE', 'NO', 'FI'].includes(countryCode)) {
-    return {
-      recommendedCountryNameFa: 'سوئیس (Switzerland)',
-      recommendedCountryCode: 'CH',
-      recommendedCityFa: 'زوریخ (Zurich)',
-      estimatedPingMs: 14,
-      privacyRatingFa: 'عالی (قوانین حریم خصوصی GDPR)',
-      recommendationReasonFa: 'سوئیس خارج از قلمرو اتحادیه‌های جاسوسی اطلاعاتی قرار داشته و بالاترین سطح حفاظت قانونی از داد‌ه‌ها و عدم ذخیره لوگ‌ها را تضمین می‌کند.',
-      recommendedProtocolsFa: ['WireGuard (UDP)', 'OpenVPN (UDP)'],
+      recommendedCityFa: 'فرانکفورت (IXP DE-CIX)',
+      estimatedPingMs: null,
+      privacyRatingFa: 'قلمرو قوانین حفاظت داده اتحادیه اروپا (GDPR)',
+      recommendationReasonFa:
+        'پیشنهاد مبتنی بر توپولوژی کلی شبکه (و نه اندازه‌گیری مستقیم به سرور VPN): مرکز تبادل ترافیک فرانکفورت (DE-CIX) معمولاً کوتاه‌ترین مسیر ترانزیت اروپایی برای شبکه‌های غرب آسیا و خاورمیانه را دارد.',
+      recommendedProtocolsFa: ['WireGuard', 'OpenVPN'],
+      isHeuristicSuggestion: true,
     };
   }
 
   return {
-    recommendedCountryNameFa: 'فنلاند (Finland)',
-    recommendedCountryCode: 'FI',
-    recommendedCityFa: 'هلسینکی (Helsinki)',
-    estimatedPingMs: 32,
-    privacyRatingFa: 'عالی (قوانین حریم خصوصی GDPR)',
-    recommendationReasonFa: 'فنلاند دارای سرورهای مدرن با پهنای باند ۱۰ گیگابیتی، قوانین ایزوله داد‌ه‌ها و کمترین نوسان پینگ در شبکه جهانی است.',
-    recommendedProtocolsFa: ['WireGuard (UDP)', 'Shadowsocks / TLS'],
+    recommendedCountryNameFa: 'سوئیس یا هلند (پیشنهاد عمومی)',
+    recommendedCountryCode: 'CH',
+    recommendedCityFa: 'زوریخ / آمستردام',
+    estimatedPingMs: null,
+    privacyRatingFa: 'قوانین حریم خصوصی سخت‌گیرانه',
+    recommendationReasonFa:
+      'این پیشنهاد صرفاً بر اساس نزدیکی جغرافیایی تقریبی و زیرساخت دیتاسنتری ارائه شده است؛ پینگ واقعی به مسیر BGP ارائه‌دهندهٔ اینترنت شما بستگی دارد.',
+    recommendedProtocolsFa: ['WireGuard', 'OpenVPN'],
+    isHeuristicSuggestion: true,
   };
 }
 
 /**
- * 1. Fetch Client IP, Geolocation, Usage Classification & Fraud Risk
+ * 1. Fetch & Cross-Verify Client-Observed Public IP vs Server-Observed IP
+ * Never returns hardcoded fallback IPs ('185.190.140.1') or fake Clean blacklist badges.
  */
 export async function fetchIpDetails(): Promise<IpDetails> {
+  const startedAt = new Date().toISOString();
+  const ipSources: ObservedIpSource[] = [];
+  const observations: string[] = [];
+
+  // Step 1A: Probe Client-Direct Public IP from independent HTTPS service #1 (ipify)
   try {
-    const res = await fetch('/api/ip-info');
-    if (res.ok) {
-      const data = await res.json();
-      if (data.success && data.data) {
-        return data.data;
+    const t0 = performance.now();
+    const res1 = await fetch('https://api64.ipify.org?format=json', {
+      cache: 'no-store',
+      signal: AbortSignal.timeout(4000),
+    });
+    if (res1.ok) {
+      const j1 = await res1.json();
+      if (j1?.ip && (isValidIpv4(j1.ip) || isValidIpv6(j1.ip))) {
+        ipSources.push({
+          sourceName: 'api64.ipify.org (Client Direct)',
+          ip: j1.ip.trim(),
+          version: isValidIpv6(j1.ip) ? 'IPv6' : 'IPv4',
+          observedFrom: 'client_direct',
+          responseTimeMs: Math.round(performance.now() - t0),
+        });
       }
     }
-  } catch (e) {
-    console.warn('Backend IP info endpoint failed, using client fallback', e);
+  } catch {
+    // Recorded in observations below if needed
   }
 
-  return {
-    ip: '185.190.140.1',
-    version: 'IPv4',
-    countryName: 'ایران',
-    countryCode: 'IR',
-    city: 'تهران',
-    region: 'تهران',
-    isp: 'همراه اول / شاتل / ایرانسل',
-    asn: 'AS12880',
-    org: 'ارائه‌دهنده خدمات اینترنت',
-    lat: 35.6892,
-    lon: 51.3890,
-    timezone: 'Asia/Tehran',
-
-    usageType: 'Residential',
-    usageTypeFa: 'مسکونی (خانگی / همراه)',
-    connectionType: 'Direct Connection',
-    connectionTypeFa: 'اتصال مستقیم خانگی (ISP)',
-    isVpnOrProxyDetected: false,
-    isDatacenter: false,
-
-    fraudRiskScore: 5,
-    fraudStatusFa: 'پاک و بدون سابقه کلاهبرداری',
-    fraudStatusEn: 'Clean (Low Risk)',
-    blacklistDetails: {
-      isGoogleFlagged: false,
-      isSpamhausFlagged: false,
-      isAbuseIpFlagged: false,
-      threatCategoryFa: 'پاک و بدون سابقه کلاهبرداری در بانک‌های اطلاعاتی',
-      threatCategoryEn: 'Clean Residential Egress',
-    },
-    userIntentAnalysisFa: 'این اتصال متعلق به اینترنت مسکونی/خانگی مستقیم (Residential ISP) می‌باشد.',
-  };
-}
-
-/**
- * 2. Perform DNS Leak Probe
- */
-export async function performDnsLeakTest(ipDetails: IpDetails | null): Promise<DnsLeakResult> {
+  // Step 1B: Probe Client-Direct Public IP from independent HTTPS service #2 (ipwho.is)
+  let clientGeoFallback: any = null;
   try {
-    const res = await fetch('/api/dns-leak-probe');
-    if (res.ok) {
-      const json = await res.json();
-      if (json.success && Array.isArray(json.resolvers)) {
-        const resolvers = json.resolvers;
+    const t1 = performance.now();
+    const res2 = await fetch('https://ipwho.is/', {
+      cache: 'no-store',
+      signal: AbortSignal.timeout(4000),
+    });
+    if (res2.ok) {
+      const j2 = await res2.json();
+      if (j2?.success !== false && j2?.ip && (isValidIpv4(j2.ip) || isValidIpv6(j2.ip))) {
+        clientGeoFallback = j2;
+        ipSources.push({
+          sourceName: 'ipwho.is (Client Direct)',
+          ip: j2.ip.trim(),
+          version: isValidIpv6(j2.ip) ? 'IPv6' : 'IPv4',
+          observedFrom: 'client_direct',
+          responseTimeMs: Math.round(performance.now() - t1),
+        });
+      }
+    }
+  } catch {
+    // Continue to server check
+  }
+
+  const clientObservedIp = ipSources.length > 0 ? ipSources[0].ip : null;
+
+  // Step 1C: Query Backend `/api/ip-info` (passing validated clientObservedIp if discovered)
+  try {
+    const query = clientObservedIp ? `?clientIp=${encodeURIComponent(clientObservedIp)}` : '';
+    const tServer = performance.now();
+    const serverRes = await fetch(`/api/ip-info${query}`, {
+      cache: 'no-store',
+      signal: AbortSignal.timeout(6000),
+    });
+
+    if (serverRes.ok) {
+      const payload = await serverRes.json();
+      if (payload.success && payload.data) {
+        const srvData: IpDetails = payload.data;
+
+        if (srvData.serverObservedIp && !isPrivateOrLocalAddress(srvData.serverObservedIp)) {
+          ipSources.push({
+            sourceName: srvData.proxyHeaderTrusted
+              ? 'App Server (Trusted Proxy Header)'
+              : 'App Server (Direct Socket)',
+            ip: srvData.serverObservedIp,
+            version: isValidIpv6(srvData.serverObservedIp) ? 'IPv6' : 'IPv4',
+            observedFrom: srvData.proxyHeaderTrusted ? 'server_trusted_header' : 'server_socket',
+            responseTimeMs: Math.round(performance.now() - tServer),
+          });
+        }
+
+        // Compare all public IPs observed across independent client & server sources
+        const uniquePublicIps = Array.from(
+          new Set(ipSources.map(s => s.ip).filter(ip => !isPrivateOrLocalAddress(ip)))
+        );
+        const ipMismatchDetected = uniquePublicIps.length > 1;
+
+        if (clientObservedIp) {
+          observations.push(`آدرس IP مشاهده‌شده مستقیم از مرورگر کلاینت: ${clientObservedIp}`);
+        }
+        if (srvData.serverObservedIp) {
+          observations.push(
+            `آدرس IP مشاهده‌شده توسط سرور برنامه: ${srvData.serverObservedIp} (${
+              srvData.proxyHeaderTrusted ? 'هدر پروکسی تاییدشده' : 'سوکت مستقیم'
+            })`
+          );
+        }
+        if (ipMismatchDetected) {
+          observations.push(
+            `هشدار مغایرت مسیر IP: منابع مستقل آدرس‌های متفاوتی (${uniquePublicIps.join(' ≠ ')}) گزارش کردند (احتمال Split-Tunneling یا پروکسی بخشی از ترافیک).`
+          );
+        }
+
         return {
-          status: 'PASS',
-          detectedResolversCount: resolvers.length,
-          resolvers,
-          isLeaking: false,
-          messageFa: 'آزمایش موفق: تمام درخواست‌های نام دامنه (DNS) به صورت رمزنگاری‌شده از کانال امن منتقل می‌شوند.',
-          messageEn: 'PASS: All DNS queries route securely through encrypted resolvers.',
+          ...srvData,
+          status: ipMismatchDetected ? 'LEAK_DETECTED' : srvData.status,
+          clientObservedIp: clientObservedIp || srvData.clientObservedIp,
+          ipSources,
+          ipMismatchDetected,
+          observations: [...observations, ...(srvData.observations || [])],
+          evidence: {
+            ...(srvData.evidence || {}),
+            clientDirectSources: ipSources,
+            uniquePublicIps,
+            ipMismatchDetected,
+          },
         };
       }
     }
-  } catch (e) {
-    console.warn('DNS leak endpoint failed, evaluating fallback', e);
+  } catch (e: any) {
+    observations.push(`خطا در ارتباط با API سرور (/api/ip-info): ${e?.message || 'Network Error'}`);
   }
 
+  // If server failed, but client-direct GeoIP succeeded, build honest result from client-direct observation
+  if (clientObservedIp) {
+    const completedAt = new Date().toISOString();
+    const uniquePublicIps = Array.from(new Set(ipSources.map(s => s.ip)));
+    const ipMismatchDetected = uniquePublicIps.length > 1;
+
+    return {
+      status: ipMismatchDetected ? 'LEAK_DETECTED' : 'PASS',
+      testName: 'Public IP & GeoIP Inspection',
+      startedAt,
+      completedAt,
+      observations: [
+        `آدرس IP از طریق استعلام مستقیم مرورگر دریافت شد: ${clientObservedIp}`,
+        'سرور برنامه پاسخ معتبری برنگرداند؛ مقایسهٔ سرور و کلاینت انجام نشد.',
+      ],
+      evidence: {
+        clientDirectSources: ipSources,
+        uniquePublicIps,
+      },
+      limitations: [
+        'موقعیت جغرافیایی صرفاً تخمین پایگاه دادهٔ GeoIP است و مکان دقیق دستگاه نیست.',
+        'به دلیل عدم پاسخ سرور، تنها دیدگاه سمت کلاینت ثبت شده است.'
+      ],
+      errorCode: null,
+      source: ipSources.map(s => s.sourceName).join(', '),
+      confidence: 'medium',
+      ip: clientObservedIp,
+      clientObservedIp,
+      serverObservedIp: null,
+      serverSocketIp: null,
+      forwardedHeaderIp: null,
+      proxyHeaderTrusted: false,
+      ipSources,
+      ipMismatchDetected,
+      version: isValidIpv6(clientObservedIp) ? 'IPv6' : 'IPv4',
+      countryName: clientGeoFallback?.country || null,
+      countryCode: clientGeoFallback?.country_code || null,
+      city: clientGeoFallback?.city || null,
+      region: clientGeoFallback?.region || null,
+      isp: clientGeoFallback?.connection?.isp || null,
+      asn: clientGeoFallback?.connection?.asn ? `AS${clientGeoFallback.connection.asn}` : null,
+      org: clientGeoFallback?.connection?.org || null,
+      lat: typeof clientGeoFallback?.latitude === 'number' ? clientGeoFallback.latitude : null,
+      lon: typeof clientGeoFallback?.longitude === 'number' ? clientGeoFallback.longitude : null,
+      timezone: clientGeoFallback?.timezone?.id || null,
+      isGeoEstimated: true,
+      usageType: 'Unknown',
+      usageTypeFa: 'نامشخص (سرویس طبقه‌بندی سرور در دسترس نبود)',
+      connectionType: 'Unknown',
+      connectionTypeFa: 'نامشخص',
+      isVpnOrProxyDetected: null,
+      isDatacenter: null,
+      fraudRiskScore: null,
+      riskFactorsFa: ['سرویس بررسی اعتبار IP در دسترس نبود؛ هیچ امتیاز ریسک جعلی تولید نشد.'],
+      fraudStatusFa: 'بررسی‌نشده (عدم دسترسی به سرویس استعلام)',
+      fraudStatusEn: 'Unverified',
+      blacklistDetails: {
+        googleSafeBrowsingStatus: 'not_configured',
+        spamhausDnsblStatus: 'not_configured',
+        abuseIpDbStatus: 'not_configured',
+        abuseConfidenceScore: null,
+        isGoogleFlagged: null,
+        isSpamhausFlagged: null,
+        isAbuseIpFlagged: null,
+        verifiedSourcesCount: 0,
+        threatCategoryFa: 'بررسی‌نشده (بدون ادعای پاک بودن)',
+        threatCategoryEn: 'Unverified',
+      },
+      userIntentAnalysisFa: 'به دلیل عدم دسترسی کامل به متادیتا، تحلیل نوع کاربری شبکه انجام نشد.',
+    };
+  }
+
+  // Complete failure: return explicit ERROR status without any fake IP or location
+  const completedAt = new Date().toISOString();
   return {
-    status: 'PASS',
-    detectedResolversCount: 4,
-    resolvers: [
-      { id: 'cf', name: 'Cloudflare Encrypted DoH', primaryIp: '1.1.1.1', location: 'ایالات متحده (Global Anycast)', status: 'فعال و امن', responseTimeMs: 14, isEncryptedDoH: true },
-      { id: 'gg', name: 'Google Public DNS', primaryIp: '8.8.8.8', location: 'ایالات متحده', status: 'فعال و امن', responseTimeMs: 18, isEncryptedDoH: true },
-      { id: 'q9', name: 'Quad9 Privacy DNS', primaryIp: '9.9.9.9', location: 'سوئیس', status: 'فعال و امن', responseTimeMs: 22, isEncryptedDoH: true },
-      { id: 'od', name: 'Cisco OpenDNS', primaryIp: '208.67.222.222', location: 'ایالات متحده', status: 'فعال و امن', responseTimeMs: 25, isEncryptedDoH: true },
+    status: 'ERROR',
+    testName: 'Public IP & GeoIP Inspection',
+    startedAt,
+    completedAt,
+    observations: [
+      'تمامی تلاش‌ها برای دریافت آدرس IP عمومی (هم از سمت کلاینت و هم از سمت سرور) با خطا یا Timeout مواجه شدند.',
+      'طبق سیاست صحت داده، هیچ آدرس IP، کشور یا ISP پیش‌فرضی جایگزین نشد.'
     ],
-    isLeaking: false,
-    messageFa: 'سرورهای DNS شناسایی شده کاملاً مطابق با استانداردهای امنیتی بوده و هیچ نشت اطلاعی یافت نشد.',
-    messageEn: 'DNS servers match high privacy standards with zero detected leaks.',
+    evidence: { ipSources: [], observations },
+    limitations: ['عدم دسترسی به سرویس‌های شناسایی IP.'],
+    errorCode: 'ALL_IP_SOURCES_FAILED',
+    source: 'None (Network Error)',
+    confidence: 'none',
+    ip: null,
+    clientObservedIp: null,
+    serverObservedIp: null,
+    serverSocketIp: null,
+    forwardedHeaderIp: null,
+    proxyHeaderTrusted: false,
+    ipSources: [],
+    ipMismatchDetected: false,
+    version: 'Unknown',
+    countryName: null,
+    countryCode: null,
+    city: null,
+    region: null,
+    isp: null,
+    asn: null,
+    org: null,
+    lat: null,
+    lon: null,
+    timezone: null,
+    isGeoEstimated: false,
+    usageType: 'Unknown',
+    usageTypeFa: 'نامشخص (خطا در دریافت IP)',
+    connectionType: 'Unknown',
+    connectionTypeFa: 'نامشخص (خطا در دریافت IP)',
+    isVpnOrProxyDetected: null,
+    isDatacenter: null,
+    fraudRiskScore: null,
+    riskFactorsFa: ['خطا در دریافت آدرس IP عمومی.'],
+    fraudStatusFa: 'نامشخص (خطا در دریافت IP)',
+    fraudStatusEn: 'Error (IP lookup failed)',
+    blacklistDetails: {
+      googleSafeBrowsingStatus: 'error',
+      spamhausDnsblStatus: 'error',
+      abuseIpDbStatus: 'error',
+      abuseConfidenceScore: null,
+      isGoogleFlagged: null,
+      isSpamhausFlagged: null,
+      isAbuseIpFlagged: null,
+      verifiedSourcesCount: 0,
+      threatCategoryFa: 'خطا در استعلام',
+      threatCategoryEn: 'Lookup Error',
+    },
+    userIntentAnalysisFa: 'به علت خطای شبکه و عدم دریافت IP معتبر، تحلیلی ثبت نشد.',
   };
 }
 
 /**
- * 3. Real WebRTC ICE Candidates Leak Probler
+ * 2. Perform Authoritative DNS Leak Test
+ * Uses unique cryptographic per-run token. Never returns fake resolvers or random latencies.
  */
-export async function performWebRtcLeakTest(publicIp: string): Promise<WebRtcLeakResult> {
-  return new Promise((resolve) => {
-    if (typeof window === 'undefined' || !window.RTCPeerConnection) {
-      resolve({
-        status: 'INCONCLUSIVE',
-        isSupported: false,
-        localIps: [],
-        publicCandidates: [],
-        isLeakingRealIp: false,
-        candidates: [],
-        messageFa: 'پروتکل WebRTC در مرورگر فعال نیست یا مسدود شده است.',
-        messageEn: 'WebRTC is disabled or unsupported in browser.',
+export async function performDnsLeakTest(ipDetails: IpDetails | null): Promise<DnsLeakResult> {
+  const startedAt = new Date().toISOString();
+  const runId = generateCryptoRunId();
+
+  try {
+    const res = await fetch(`/api/dns-leak-probe?runId=${encodeURIComponent(runId)}`, {
+      cache: 'no-store',
+      signal: AbortSignal.timeout(6000),
+    });
+
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      return evaluateDnsTestResult({
+        runId,
+        authoritativeConfigured: Boolean(errBody?.authoritativeConfigured),
+        resolvers: [],
+        ipDetails,
+        startedAt,
+        completedAt: new Date().toISOString(),
+        errorMessage: errBody?.error || `HTTP ${res.status}`,
       });
+    }
+
+    const json = await res.json();
+    const authoritativeConfigured = Boolean(json.authoritativeConfigured);
+    const dnsLeakDomain = json.dnsLeakDomain as string | null;
+
+    // If an authoritative DNS domain IS configured, trigger 3 unique cache-bypassing subqueries from the browser
+    if (authoritativeConfigured && dnsLeakDomain) {
+      const probeUrls = [1, 2, 3].map(
+        i => `https://p${i}-${runId}.${dnsLeakDomain}/?nocache=${Date.now()}_${i}`
+      );
+      await Promise.allSettled(
+        probeUrls.map(u =>
+          fetch(u, { mode: 'no-cors', cache: 'no-store', signal: AbortSignal.timeout(2500) })
+        )
+      );
+
+      // Re-fetch captured authoritative DNS logs for this runId
+      const collectRes = await fetch(`/api/dns-leak-probe?runId=${encodeURIComponent(runId)}`, {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(5000),
+      });
+      if (collectRes.ok) {
+        const collectJson = await collectRes.json();
+        return evaluateDnsTestResult({
+          runId,
+          authoritativeConfigured: true,
+          resolvers: Array.isArray(collectJson.resolvers) ? collectJson.resolvers : [],
+          ipDetails,
+          startedAt,
+          completedAt: new Date().toISOString(),
+        });
+      }
+    }
+
+    return evaluateDnsTestResult({
+      runId,
+      authoritativeConfigured,
+      resolvers: Array.isArray(json.resolvers) ? json.resolvers : [],
+      ipDetails,
+      startedAt,
+      completedAt: new Date().toISOString(),
+    });
+  } catch (e: any) {
+    return evaluateDnsTestResult({
+      runId,
+      authoritativeConfigured: false,
+      resolvers: [],
+      ipDetails,
+      startedAt,
+      completedAt: new Date().toISOString(),
+      errorMessage: e?.message || 'خطای شبکه در ارتباط با سرویس تست DNS',
+    });
+  }
+}
+
+/**
+ * 3. Real Browser WebRTC ICE Candidates Leak Test
+ * Never injects fake local IPs ('192.168.1.105') and never reports PASS when 0 STUN candidates are gathered.
+ */
+export async function performWebRtcLeakTest(
+  referenceIpOrDetails: string | IpDetails | null
+): Promise<WebRtcLeakResult> {
+  const startedAt = new Date().toISOString();
+  const stunServersUsed = [
+    'stun:stun.l.google.com:19302',
+    'stun:stun1.l.google.com:19302',
+    'stun:stun.cloudflare.com:3478',
+  ];
+
+  const referencePublicIps: string[] = [];
+  if (typeof referenceIpOrDetails === 'string' && referenceIpOrDetails.trim()) {
+    referencePublicIps.push(referenceIpOrDetails.trim());
+  } else if (referenceIpOrDetails && typeof referenceIpOrDetails === 'object') {
+    if (referenceIpOrDetails.ip) referencePublicIps.push(referenceIpOrDetails.ip);
+    if (referenceIpOrDetails.clientObservedIp) referencePublicIps.push(referenceIpOrDetails.clientObservedIp);
+    if (referenceIpOrDetails.serverObservedIp) referencePublicIps.push(referenceIpOrDetails.serverObservedIp);
+  }
+
+  return new Promise(resolve => {
+    if (typeof window === 'undefined' || typeof window.RTCPeerConnection === 'undefined') {
+      resolve(
+        evaluateWebRtcCandidates({
+          isSupported: false,
+          candidates: [],
+          referencePublicIps,
+          stunServersUsed,
+          startedAt,
+          completedAt: new Date().toISOString(),
+        })
+      );
       return;
     }
 
-    const localIpsSet = new Set<string>();
-    const publicIpsSet = new Set<string>();
-    const candidatesList: any[] = [];
+    const candidatesList: WebRtcCandidate[] = [];
+    const seenKeys = new Set<string>();
+    let finished = false;
 
-    let pc: RTCPeerConnection | null = new RTCPeerConnection({
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun2.l.google.com:19302' },
-      ]
-    });
+    let pc: RTCPeerConnection | null = null;
+    try {
+      pc = new RTCPeerConnection({
+        iceServers: stunServersUsed.map(url => ({ urls: url })),
+      });
+    } catch (err: any) {
+      resolve(
+        evaluateWebRtcCandidates({
+          isSupported: true,
+          candidates: [],
+          referencePublicIps,
+          stunServersUsed,
+          startedAt,
+          completedAt: new Date().toISOString(),
+          errorMessage: err?.message || 'Failed to construct RTCPeerConnection',
+        })
+      );
+      return;
+    }
 
-    let timeoutId = setTimeout(() => {
+    const finishTest = (errorMessage?: string) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timeoutId);
+      try {
+        pc?.close();
+      } catch {
+        // Ignore close error
+      }
+      pc = null;
+
+      resolve(
+        evaluateWebRtcCandidates({
+          isSupported: true,
+          candidates: candidatesList,
+          referencePublicIps,
+          stunServersUsed,
+          startedAt,
+          completedAt: new Date().toISOString(),
+          errorMessage,
+        })
+      );
+    };
+
+    const timeoutId = setTimeout(() => {
       finishTest();
     }, 3500);
 
-    function finishTest() {
-      if (!pc) return;
-      pc.close();
-      pc = null;
-      clearTimeout(timeoutId);
-
-      const localIps = Array.from(localIpsSet);
-      const publicCandidates = Array.from(publicIpsSet);
-
-      let isLeakingRealIp = false;
-      if (publicIp && publicCandidates.length > 0) {
-        isLeakingRealIp = publicCandidates.some(ip => ip !== publicIp && !ip.startsWith('192.168.') && !ip.startsWith('10.') && !ip.startsWith('172.'));
-      }
-
-      const status: TestStatus = isLeakingRealIp ? 'LEAK_DETECTED' : 'PASS';
-
-      resolve({
-        status,
-        isSupported: true,
-        localIps: localIps.length > 0 ? localIps : ['192.168.1.105 (محفوظ)'],
-        publicCandidates,
-        isLeakingRealIp,
-        candidates: candidatesList,
-        messageFa: isLeakingRealIp
-          ? 'هشدار شدید: آدرس IP واقعی شما از طریق کاندیداهای WebRTC لو رفته است!'
-          : 'آزمایش موفق: هیچ نشت آدرس IP واقعی یا محلی از طریق WebRTC مرورگر مشاهده نشد.',
-        messageEn: isLeakingRealIp
-          ? 'CRITICAL LEAK: WebRTC exposed your unmasked public IP address!'
-          : 'PASS: WebRTC candidate interfaces are properly masked or shielded.',
-      });
-    }
-
     try {
-      pc.createDataChannel('leak_probe');
-      pc.createOffer().then(offer => pc?.setLocalDescription(offer)).catch(() => {});
-
-      pc.onicecandidate = (event) => {
+      pc.createDataChannel('netleakgard_webrtc_probe');
+      pc.onicecandidate = event => {
         if (!event || !event.candidate) {
           finishTest();
           return;
         }
-
-        const candidateStr = event.candidate.candidate;
-        const parts = candidateStr.split(' ');
-        const ip = parts[4];
-        const port = parseInt(parts[5] || '0', 10);
-        const type = (parts[7] || 'host') as any;
-        const protocol = parts[2] || 'UDP';
-
-        if (ip) {
-          const isLocal = ip.startsWith('192.168.') || ip.startsWith('10.') || ip.startsWith('172.16.') || ip.endsWith('.local');
-          if (isLocal) {
-            localIpsSet.add(ip);
-          } else {
-            publicIpsSet.add(ip);
+        const parsed = parseIceCandidateLine(event.candidate.candidate);
+        if (parsed) {
+          const key = `${parsed.type}:${parsed.protocol}:${parsed.ip}:${parsed.port}`;
+          if (!seenKeys.has(key)) {
+            seenKeys.add(key);
+            candidatesList.push(parsed);
           }
-
-          candidatesList.push({
-            ip,
-            type,
-            protocol,
-            port,
-            isLocalLanIp: isLocal
-          });
         }
       };
-    } catch (e) {
-      finishTest();
+      pc.onicecandidateerror = () => {
+        // ICE candidate error on individual STUN server; wait for gathering complete or timeout
+      };
+
+      pc.createOffer()
+        .then(offer => pc?.setLocalDescription(offer))
+        .catch((err: any) => {
+          finishTest(err?.message || 'RTCPeerConnection createOffer failed');
+        });
+    } catch (err: any) {
+      finishTest(err?.message || 'WebRTC execution exception');
     }
   });
 }
 
 /**
- * 4. Advanced VPN & Protocol Fingerprinting Assessment
+ * 4. Probabilistic VPN & Network Egress Assessment
  */
-export function performVpnAnalysis(ipDetails: IpDetails | null, dnsLeak: DnsLeakResult | null): VpnProxyResult {
-  if (!ipDetails) {
-    return {
-      status: 'INCONCLUSIVE',
-      score: 50,
-      isDatacenterIp: false,
-      isTorNode: false,
-      isKnownProxy: false,
-      mismatchDnsCountry: false,
-      encryptionStrength: 'متوسط (L2TP/IPsec)',
-      protocolType: 'اتصال مستقیم ISP',
-      protocolDetails: {
-        name: 'اتصال مستقیم ISP (No VPN)',
-        code: 'direct',
-        encryptionNameFa: 'بدون رمزنگاری VPN',
-        estimatedMtu: 1500,
-        obfuscationStatusFa: 'غیرفعال',
-        descriptionFa: 'اتصال مستقیم شبکه اینترنت بدون عبور از پروتکل‌های رمزنگاری شده تونل VPN.',
-      },
-      messageFa: 'اطلاعات شبکه کافی برای ارزیابی دقیق تونل VPN موجود نیست.',
-      messageEn: 'Insufficient network data for VPN evaluation.',
-    };
-  }
-
-  const isDatacenter = ipDetails.isDatacenter || ipDetails.isVpnOrProxyDetected;
-  
-  let score = 100;
-  if (!isDatacenter) {
-    score -= 30;
-  }
-  if (dnsLeak?.isLeaking) {
-    score -= 40;
-  }
-
-  const status: TestStatus = isDatacenter ? 'PASS' : 'WARNING';
-
-  let protocolDetails: VpnProtocolDetails = {
-    name: 'اتصال مستقیم ISP (بدون VPN)',
-    code: 'direct',
-    encryptionNameFa: 'بدون تونل رمزنگاری',
-    estimatedMtu: 1500,
-    obfuscationStatusFa: 'بدون پنهان‌سازی (Plaintext)',
-    descriptionFa: 'ترافیک شما به صورت مستقیم از طریق ارائه‌دهنده اینترنت خانگی/همراه منتقل می‌گردد.',
-  };
-
-  if (isDatacenter) {
-    const asnStr = (ipDetails.asn || '').toLowerCase();
-    const ispStr = (ipDetails.isp || '').toLowerCase();
-
-    if (asnStr.includes('cloudflare') || ispStr.includes('warp') || ispStr.includes('wireguard')) {
-      protocolDetails = {
-        name: 'WireGuard (UDP / ChaCha20)',
-        code: 'wireguard',
-        encryptionNameFa: 'ChaCha20-Poly1305 (256-bit)',
-        estimatedMtu: 1420,
-        obfuscationStatusFa: 'پروتکل مدرن کم‌تاخیر (UDP)',
-        descriptionFa: 'پروتکل سریع و مدرن WireGuard با هدر ۱۴۲۰ بایت و الگوریتم رمزنگاری پیشرفته ChaCha20.',
-      };
-    } else if (ispStr.includes('vless') || ispStr.includes('v2ray') || ispStr.includes('shadowsocks') || ispStr.includes('digitalocean') || ispStr.includes('hetzner')) {
-      protocolDetails = {
-        name: 'Shadowsocks / VLESS (TLS Obfuscated)',
-        code: 'v2ray',
-        encryptionNameFa: 'AES-128-GCM / TLS 1.3',
-        estimatedMtu: 1440,
-        obfuscationStatusFa: 'پنهان‌سازی پیشرفته (TLS 1.3 Camouflage)',
-        descriptionFa: 'پروتکل پنهان‌ساز ترافیک (Camouflage) بر بستر TLS جهت عبور از فیلترینگ و مسدودسازی شبکه.',
-      };
-    } else {
-      protocolDetails = {
-        name: 'OpenVPN (UDP/TCP / AES-256-GCM)',
-        code: 'openvpn',
-        encryptionNameFa: 'AES-256-GCM / OpenSSL',
-        estimatedMtu: 1400,
-        obfuscationStatusFa: 'رمزنگاری استاندارد صنعتی',
-        descriptionFa: 'پروتکل استاندارد و امن OpenVPN با دست‌رشته ۲۵۶ بیتی و هدر افت ۱۴۰۰ بایت.',
-      };
-    }
-  }
-
-  return {
-    status,
-    score: Math.max(20, Math.min(100, score)),
-    isDatacenterIp: isDatacenter,
-    isTorNode: false,
-    isKnownProxy: isDatacenter,
-    mismatchDnsCountry: false,
-    encryptionStrength: isDatacenter ? 'عالی (ChaCha20 / AES-256)' : 'پایین / ضعیف',
-    protocolType: protocolDetails.name,
-    protocolDetails,
-    messageFa: isDatacenter
-      ? `پروتکل شناسایی‌شده: ${protocolDetails.name}. آدرس IP اصلی شما توسط تونل دیتاسنتر پنهان گردیده است.`
-      : 'هشدار: اتصال شما به صورت مستقیم (بدون VPN) می‌باشد و آدرس IP خانگی/همراه شما نمایان است.',
-    messageEn: isDatacenter
-      ? `Detected Protocol: ${protocolDetails.name}. Your IP is masked behind datacenter infrastructure.`
-      : 'WARNING: Connection is direct (No VPN detected). Your home/mobile IP is exposed.',
-  };
+export function performVpnAnalysis(
+  ipDetails: IpDetails | null,
+  dnsLeak: DnsLeakResult | null
+): VpnProxyResult {
+  return evaluateVpnHeuristic(ipDetails, dnsLeak);
 }
 
 /**
- * 5. Consecutive Ping Probes & Stability Measurement
+ * 5. Real HTTP RTT Latency, Jitter, Packet Loss & Bounded Download Speed Measurement
+ * Never fabricates random ping numbers or fake download speeds on failure.
  */
-export async function measurePingAndSpeed(): Promise<NetworkMetrics> {
-  const pings: number[] = [];
+export async function measurePingAndSpeed(signal?: AbortSignal): Promise<NetworkMetrics> {
+  const startedAt = new Date().toISOString();
+  const rttSamplesMs: number[] = [];
+  const totalProbes = 6;
+  let probesSent = 0;
+  let probesReceived = 0;
+  let lastError: string | undefined;
 
-  for (let i = 0; i < 8; i++) {
-    const start = performance.now();
+  for (let i = 0; i < totalProbes; i++) {
+    if (signal?.aborted) {
+      lastError = 'آزمایش توسط کاربر لغو شد.';
+      break;
+    }
+    probesSent += 1;
+    const t0 = performance.now();
     try {
-      await fetch('/api/ping?t=' + Date.now() + '_' + i, { cache: 'no-store' });
-      const duration = Math.round(performance.now() - start);
-      pings.push(Math.max(8, duration));
-    } catch (e) {
-      pings.push(Math.floor(Math.random() * 15) + 25);
+      const resp = await fetch(`/api/ping?seq=${i}&t=${Date.now()}`, {
+        cache: 'no-store',
+        signal: signal || AbortSignal.timeout(3000),
+      });
+      if (resp.ok) {
+        const rtt = Math.round((performance.now() - t0) * 10) / 10;
+        rttSamplesMs.push(rtt);
+        probesReceived += 1;
+      } else {
+        lastError = `HTTP ${resp.status} on /api/ping`;
+      }
+    } catch (e: any) {
+      lastError = e?.message || 'Ping probe timeout';
     }
   }
 
-  const avgPing = Math.round(pings.reduce((a, b) => a + b, 0) / pings.length);
-  
-  let totalDiff = 0;
-  for (let i = 1; i < pings.length; i++) {
-    totalDiff += Math.abs(pings[i] - pings[i - 1]);
-  }
-  const jitter = Math.round(totalDiff / (pings.length - 1));
+  let downloadMbps: number | null = null;
+  let bytesTransferred = 0;
+  let durationMs = 0;
 
-  let stabilityScore = 98;
-  if (jitter > 20) {
-    stabilityScore = 60;
-  } else if (jitter > 10) {
-    stabilityScore = 80;
-  } else if (jitter > 5) {
-    stabilityScore = 90;
-  }
-
-  let stabilityStatusFa: 'پایدار و عالی' | 'دارای نوسان جزئی' | 'ناپایدار (Jitter بالا)' = 'پایدار و عالی';
-  if (jitter > 15) {
-    stabilityStatusFa = 'ناپایدار (Jitter بالا)';
-  } else if (jitter > 6) {
-    stabilityStatusFa = 'دارای نوسان جزئی';
-  }
-
-  let downloadMbps = 18.5;
-  try {
-    const downloadStart = performance.now();
-    const speedResp = await fetch('/api/speed-test/chunk?t=' + Date.now());
-    if (speedResp.ok) {
-      const blob = await speedResp.blob();
-      const downloadMs = performance.now() - downloadStart;
-      const sizeBits = blob.size * 8;
-      downloadMbps = Math.round(((sizeBits / (downloadMs / 1000)) / 1000000) * 10) / 10;
-      if (downloadMbps <= 0) downloadMbps = 15.2;
+  if (probesReceived > 0 && !signal?.aborted) {
+    try {
+      const chunkBytes = 512 * 1024; // 512 KB bounded test payload
+      const dlStart = performance.now();
+      const speedResp = await fetch(`/api/speed-test/chunk?bytes=${chunkBytes}&t=${Date.now()}`, {
+        cache: 'no-store',
+        signal: signal || AbortSignal.timeout(8000),
+      });
+      if (speedResp.ok) {
+        const buf = await speedResp.arrayBuffer();
+        durationMs = performance.now() - dlStart;
+        bytesTransferred = buf.byteLength;
+        if (durationMs > 0 && bytesTransferred > 0) {
+          const bits = bytesTransferred * 8;
+          downloadMbps = Math.round(((bits / (durationMs / 1000)) / 1_000_000) * 100) / 100;
+        }
+      } else {
+        lastError = `Speed test HTTP ${speedResp.status}`;
+      }
+    } catch (e: any) {
+      lastError = e?.message || 'Speed test failed';
     }
-  } catch (e) {
-    downloadMbps = 24.8;
   }
 
-  return {
-    pingMs: Math.max(8, avgPing),
-    jitterMs: Math.max(2, jitter),
-    downloadMbps: Math.max(5, downloadMbps),
-    packetLossPercent: 0,
-    pingSamples: pings,
-    stabilityScore,
-    stabilityStatusFa,
-    testingPing: false,
-    testingSpeed: false,
-  };
+  return calculateHttpPingMetrics({
+    rttSamplesMs,
+    probesSent,
+    probesReceived,
+    downloadMbps,
+    bytesTransferred,
+    durationMs,
+    startedAt,
+    completedAt: new Date().toISOString(),
+    errorMessage: lastError,
+  });
 }
 
 /**
- * 6. Gemini AI Deep Security Audit Query
+ * 6. Gemini AI Security Audit Query (Strictly grounded in real observations)
  */
 export async function fetchAiAudit(networkData: any): Promise<AiAuditReport> {
-  const nodeSuggestion = generateOptimalVpnNodeSuggestion(networkData?.ipDetails, networkData?.pingMs || 35);
-  const dnsRecs = generateEncryptedDnsRecommendations(networkData?.ipDetails);
+  const nodeSuggestion = generateOptimalVpnNodeSuggestion(
+    networkData?.ipDetails || null,
+    networkData?.pingMs ?? null
+  );
+  const dnsRecs = generateEncryptedDnsRecommendations(networkData?.ipDetails || null);
 
   try {
     const res = await fetch('/api/gemini-audit', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ networkData })
+      body: JSON.stringify({ networkData }),
+      signal: AbortSignal.timeout(8000),
     });
     if (res.ok) {
       const json = await res.json();
@@ -499,26 +699,29 @@ export async function fetchAiAudit(networkData: any): Promise<AiAuditReport> {
         };
       }
     }
-  } catch (e) {
-    console.warn('AI audit fetch failed', e);
+  } catch {
+    // Handled below without fabricating fake positive security claims
   }
 
   return {
-    riskScore: networkData?.fraudRiskScore || 15,
-    statusLevel: 'امن',
-    summaryFa: 'وضعیت شبکه، پروتکل وی‌پی‌ان و پایداری لایه ارتباطی در حد مطلوب ارزیابی گردید.',
+    riskScore: null,
+    statusLevel: 'نامشخص',
+    summaryFa:
+      'سرویس تحلیل هوش مصنوعی پاسخ نداد یا تنظیم نشده است. نتایج زیر مستقیماً از مشاهدات واقعی تست‌های شبکه استخراج شده‌اند.',
     detailedAnalysisFa: [
-      'آدرس IP از نوع مسکونی/خانگی یا دیتاسنتر ارزیابی گردید.',
-      'پروتکل VPN شناسایی شده با الگوریتم رمزنگاری پیشرفته اجرا می‌شود.',
-      'سرورهای DNS از پروتکل رمزنگاری DoH استفاده می‌کنند.'
+      networkData?.ip
+        ? `آدرس IP مشاهده‌شده: ${networkData.ip} (${networkData.usageTypeFa || 'نامشخص'})`
+        : 'آدرس IP عمومی دریافت نشد (خطای شبکه).',
+      `وضعیت تست DNS: ${networkData?.dnsLeakStatus || 'تنظیم‌نشده (not_configured)'}`,
+      `وضعیت تست WebRTC: ${networkData?.webRtcLeakStatus || 'نامشخص'}`,
     ],
     threatsFoundFa: [],
     recommendationsFa: [
-      'فعال نگه‌داشتن قابلیت Kill Switch در نرم‌افزار VPN.',
-      'بررسی دوره‌ای سلامت DNS مرورگر.'
+      'برای اثبات قطعی عدم نشت DNS، دامنهٔ Authoritative DNS اختصاصی (DNS_LEAK_DOMAIN) باید روی سرور تنظیم شود.',
+      'توجه داشته باشید که تست‌های داخل مرورگر، وضعیت تمام ترافیک سطح سیستم‌عامل را اثبات نمی‌کنند.'
     ],
     optimalNodeSuggestion: nodeSuggestion,
     dnsRecommendations: dnsRecs,
-    aiAvailable: false
+    aiAvailable: false,
   };
 }

@@ -19,6 +19,7 @@ import {
   measurePingAndSpeed,
   fetchAiAudit
 } from './services/networkTester';
+import { evaluateOverallSummary } from './utils/networkEvaluator';
 import { Header } from './components/Header';
 import { HeroScoreBanner } from './components/HeroScoreBanner';
 import { Globe3D } from './components/Globe3D';
@@ -47,7 +48,7 @@ import {
   Download
 } from 'lucide-react';
 
-const LOCAL_STORAGE_HISTORY_KEY = 'leakguard_score_history';
+const LOCAL_STORAGE_HISTORY_KEY = 'leakguard_score_history_v2';
 
 export default function App() {
   const [lang, setLang] = useState<Language>('fa');
@@ -73,7 +74,9 @@ export default function App() {
   const [aiAudit, setAiAudit] = useState<AiAuditReport | null>(null);
 
   const [overallStatus, setOverallStatus] = useState<TestStatus>('IDLE');
-  const [privacyScore, setPrivacyScore] = useState<number>(100);
+  const [privacyScore, setPrivacyScore] = useState<number | null>(null);
+  const [isScoreCalculable, setIsScoreCalculable] = useState<boolean>(false);
+  const [scoreReasonsFa, setScoreReasonsFa] = useState<string[]>([]);
 
   // Privacy Score History State
   const [scoreHistory, setScoreHistory] = useState<ScoreHistoryPoint[]>(() => {
@@ -81,7 +84,7 @@ export default function App() {
       try {
         const saved = localStorage.getItem(LOCAL_STORAGE_HISTORY_KEY);
         if (saved) return JSON.parse(saved);
-      } catch (e) {
+      } catch {
         // Fallback
       }
     }
@@ -98,7 +101,7 @@ export default function App() {
   useEffect(() => {
     try {
       localStorage.setItem(LOCAL_STORAGE_HISTORY_KEY, JSON.stringify(scoreHistory));
-    } catch (e) {
+    } catch {
       // Storage full
     }
   }, [scoreHistory]);
@@ -107,7 +110,7 @@ export default function App() {
     setScoreHistory([]);
     try {
       localStorage.removeItem(LOCAL_STORAGE_HISTORY_KEY);
-    } catch (e) {
+    } catch {
       // Storage error
     }
   };
@@ -116,7 +119,7 @@ export default function App() {
   const playSuccessSound = useCallback(() => {
     if (!soundEnabled || typeof window === 'undefined') return;
     try {
-      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       if (!AudioCtx) return;
       const ctx = new AudioCtx();
       const now = ctx.currentTime;
@@ -142,18 +145,7 @@ export default function App() {
       gain2.connect(ctx.destination);
       osc2.start(now + 0.1);
       osc2.stop(now + 0.4);
-
-      const osc3 = ctx.createOscillator();
-      const gain3 = ctx.createGain();
-      osc3.type = 'sine';
-      osc3.frequency.setValueAtTime(783.99, now + 0.2);
-      gain3.gain.setValueAtTime(0.15, now + 0.2);
-      gain3.gain.exponentialRampToValueAtTime(0.001, now + 0.55);
-      osc3.connect(gain3);
-      gain3.connect(ctx.destination);
-      osc3.start(now + 0.2);
-      osc3.stop(now + 0.55);
-    } catch (e) {
+    } catch {
       // Audio context policy
     }
   }, [soundEnabled]);
@@ -162,7 +154,7 @@ export default function App() {
   const playLeakAlarmSound = useCallback(() => {
     if (!soundEnabled || typeof window === 'undefined') return;
     try {
-      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       if (!AudioCtx) return;
       const ctx = new AudioCtx();
       const now = ctx.currentTime;
@@ -185,7 +177,7 @@ export default function App() {
         osc.start(startTime);
         osc.stop(startTime + 0.15);
       }
-    } catch (e) {
+    } catch {
       // Audio context policy
     }
   }, [soundEnabled]);
@@ -211,45 +203,38 @@ export default function App() {
       const speedRes = await measurePingAndSpeed();
       setMetrics(speedRes);
 
-      let score = 100;
-      let finalStatus: TestStatus = 'PASS';
+      // Strictly evidence-based overall evaluation (no fake 100 score when DNS/WebRTC is unconfigured or inconclusive!)
+      const summary = evaluateOverallSummary({
+        ipDetails: ipData,
+        dnsLeak: dnsRes,
+        webRtcLeak: webRtcRes,
+        vpnProxy: vpnRes,
+      });
 
-      if (webRtcRes.isLeakingRealIp) {
-        score -= 40;
-        finalStatus = 'LEAK_DETECTED';
+      setOverallStatus(summary.overallStatus);
+      setPrivacyScore(summary.privacyScore);
+      setIsScoreCalculable(summary.isScoreCalculable);
+      setScoreReasonsFa(summary.reasonsFa);
+
+      // Only add to Score History Chart if a valid numeric score was actually calculable from complete evidence
+      if (summary.isScoreCalculable && summary.privacyScore !== null) {
+        const nowObj = new Date();
+        const timeStr = nowObj.toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit' });
+        const dateStr = nowObj.toLocaleDateString('fa-IR');
+
+        const historyPoint: ScoreHistoryPoint = {
+          id: Date.now().toString(),
+          timestamp: timeStr,
+          fullDate: dateStr,
+          score: summary.privacyScore,
+          ip: ipData.ip || 'نامشخص',
+          statusFa: summary.overallStatus === 'PASS' ? 'بدون نشت مشاهده‌شده' : 'هشدار / نشت',
+        };
+
+        setScoreHistory(prev => [...prev.slice(-14), historyPoint]);
       }
-      if (dnsRes.isLeaking) {
-        score -= 30;
-        finalStatus = 'LEAK_DETECTED';
-      }
-      if (!ipData.isDatacenter) {
-        score -= 20;
-        if (finalStatus !== 'LEAK_DETECTED') {
-          finalStatus = 'WARNING';
-        }
-      }
 
-      const calculatedScore = Math.max(10, Math.min(100, score));
-      setPrivacyScore(calculatedScore);
-      setOverallStatus(finalStatus);
-
-      // Add to Score History Chart
-      const nowObj = new Date();
-      const timeStr = nowObj.toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit' });
-      const dateStr = nowObj.toLocaleDateString('fa-IR');
-
-      const historyPoint: ScoreHistoryPoint = {
-        id: Date.now().toString(),
-        timestamp: timeStr,
-        fullDate: dateStr,
-        score: calculatedScore,
-        ip: ipData.ip,
-        statusFa: finalStatus === 'PASS' ? 'اتصال امن' : 'هشدار / نشت',
-      };
-
-      setScoreHistory(prev => [...prev.slice(-14), historyPoint]);
-
-      // Step 6: Gemini AI Audit Synthesis
+      // Gemini AI Audit Synthesis
       const auditRes = await fetchAiAudit({
         ip: ipData.ip,
         ipDetails: ipData,
@@ -258,10 +243,10 @@ export default function App() {
         isp: ipData.isp,
         asn: ipData.asn,
         isVpnOrProxyDetected: ipData.isVpnOrProxyDetected,
-        dnsLeakStatus: dnsRes.isLeaking ? 'نشت شناسایی شد' : 'بدون نشت',
+        dnsLeakStatus: dnsRes.status,
         dnsServerCount: dnsRes.detectedResolversCount,
-        webRtcLeakStatus: webRtcRes.isLeakingRealIp ? 'نشت شدید IP' : 'محافظت‌شده',
-        localWebRtcIp: webRtcRes.localIps[0] || 'پنهان',
+        webRtcLeakStatus: webRtcRes.status,
+        localWebRtcIp: webRtcRes.localIps[0] || (webRtcRes.mdnsHosts[0] ?? 'مشاهده نشد'),
         pingMs: speedRes.pingMs,
         fraudRiskScore: ipData.fraudRiskScore,
         fraudStatusFa: ipData.fraudStatusFa,
@@ -271,15 +256,16 @@ export default function App() {
 
       setAiAudit(auditRes);
 
-      if (finalStatus === 'LEAK_DETECTED' || finalStatus === 'WARNING') {
+      if (summary.overallStatus === 'LEAK_DETECTED') {
         playLeakAlarmSound();
-      } else {
+      } else if (summary.overallStatus === 'PASS') {
         playSuccessSound();
       }
-
     } catch (e) {
       console.error('Leak test execution error', e);
-      setOverallStatus('INCONCLUSIVE');
+      setOverallStatus('ERROR');
+      setPrivacyScore(null);
+      setIsScoreCalculable(false);
     } finally {
       setIsTesting(false);
     }
@@ -323,6 +309,7 @@ export default function App() {
     aiAudit,
     overallStatus,
     privacyScore,
+    isScoreCalculable,
   };
 
   const t = translations[lang];
@@ -337,8 +324,8 @@ export default function App() {
           <WifiOff className="w-4 h-4 animate-pulse" />
           <span>
             {isFa
-              ? 'حالت آفلاین فعال است — اتصال اینترنت برقرار نیست؛ آخرین گزارش ذخیره شده در کش نمایش داده می‌شود.'
-              : 'Offline Mode — Using cached network security report.'}
+              ? 'حالت آفلاین فعال است — اتصال اینترنت برقرار نیست؛ انجام اندازه‌گیری زنده شبکه امکان‌پذیر نیست.'
+              : 'Offline Mode — Live network measurements require an active internet connection.'}
           </span>
         </div>
       )}
@@ -392,6 +379,8 @@ export default function App() {
         <HeroScoreBanner
           lang={lang}
           privacyScore={privacyScore}
+          isScoreCalculable={isScoreCalculable}
+          scoreReasonsFa={scoreReasonsFa}
           overallStatus={overallStatus}
           ipDetails={ipDetails}
           dnsLeak={dnsLeak}

@@ -1,39 +1,98 @@
 export type Language = 'fa' | 'en';
 
-export type TestStatus = 'IDLE' | 'TESTING' | 'PASS' | 'WARNING' | 'LEAK_DETECTED' | 'INCONCLUSIVE';
+/**
+ * Standardized test statuses:
+ * - PASS / pass: Verified with sufficient real evidence
+ * - LEAK_DETECTED / leak_detected: Confirmed leak based on real evidence
+ * - WARNING / warning: Potential risk or direct connection without leak proof
+ * - INCONCLUSIVE / inconclusive: Insufficient evidence to prove pass or leak
+ * - UNSUPPORTED / unsupported: Feature not supported in current browser/environment
+ * - ERROR / error: Test failed due to network/API/timeout error
+ * - NOT_CONFIGURED / not_configured: External infrastructure (e.g., Authoritative DNS domain or API key) not configured
+ * - IDLE / TESTING: Execution lifecycle states
+ */
+export type TestStatus =
+  | 'IDLE'
+  | 'TESTING'
+  | 'PASS'
+  | 'WARNING'
+  | 'LEAK_DETECTED'
+  | 'INCONCLUSIVE'
+  | 'UNSUPPORTED'
+  | 'ERROR'
+  | 'NOT_CONFIGURED';
+
+export type ConfidenceLevel = 'high' | 'medium' | 'low' | 'none';
+
+export interface StandardTestMetadata {
+  status: TestStatus;
+  testName: string;
+  startedAt: string | null;
+  completedAt: string | null;
+  observations: string[];
+  evidence: Record<string, unknown>;
+  limitations: string[];
+  errorCode: string | null;
+  source: string;
+  confidence: ConfidenceLevel;
+}
+
+export type BlacklistSourceStatus = 'clean' | 'flagged' | 'not_configured' | 'error' | 'unknown';
 
 export interface IpBlacklistDetails {
-  isGoogleFlagged: boolean;
-  isSpamhausFlagged: boolean;
-  isAbuseIpFlagged: boolean;
+  googleSafeBrowsingStatus: BlacklistSourceStatus;
+  spamhausDnsblStatus: BlacklistSourceStatus;
+  abuseIpDbStatus: BlacklistSourceStatus;
+  abuseConfidenceScore: number | null;
+  isGoogleFlagged: boolean | null;
+  isSpamhausFlagged: boolean | null;
+  isAbuseIpFlagged: boolean | null;
+  verifiedSourcesCount: number;
   threatCategoryFa: string;
   threatCategoryEn: string;
 }
 
-export interface IpDetails {
+export interface ObservedIpSource {
+  sourceName: string;
   ip: string;
   version: 'IPv4' | 'IPv6';
-  countryName: string;
-  countryCode: string;
-  city: string;
-  region: string;
-  isp: string;
-  asn: string;
-  org: string;
-  lat: number;
-  lon: number;
-  timezone: string;
-  
-  usageType: 'Residential' | 'Commercial' | 'Datacenter' | 'Mobile';
-  usageTypeFa: 'مسکونی (خانگی / همراه)' | 'تجاری (شرکتی / دیتاسنتر)' | 'مرکز داده (Datacenter)' | 'اپراتور همراه';
-  connectionType: 'VPN / Proxy Active' | 'Direct Connection' | 'Tor Exit Node';
-  connectionTypeFa: 'اتصال تونل VPN / پروکسی فعال' | 'اتصال مستقیم خانگی (ISP)' | 'گره خروجی تور (Tor)';
-  isVpnOrProxyDetected: boolean;
-  isDatacenter: boolean;
-  
-  fraudRiskScore: number;
-  fraudStatusFa: 'پاک و بدون سابقه کلاهبرداری' | 'مشکوک (ریسک متوسط)' | 'فلگ‌شده در لیست سیاه (پرریسک)';
-  fraudStatusEn: 'Clean (Low Risk)' | 'Suspicious (Medium Risk)' | 'Flagged Fraud (High Risk)';
+  observedFrom: 'client_direct' | 'server_socket' | 'server_trusted_header';
+  responseTimeMs: number;
+}
+
+export interface IpDetails extends StandardTestMetadata {
+  ip: string | null;
+  clientObservedIp: string | null;
+  serverObservedIp: string | null;
+  serverSocketIp: string | null;
+  forwardedHeaderIp: string | null;
+  proxyHeaderTrusted: boolean;
+  ipSources: ObservedIpSource[];
+  ipMismatchDetected: boolean;
+  version: 'IPv4' | 'IPv6' | 'Unknown';
+  countryName: string | null;
+  countryCode: string | null;
+  city: string | null;
+  region: string | null;
+  isp: string | null;
+  asn: string | null;
+  org: string | null;
+  lat: number | null;
+  lon: number | null;
+  timezone: string | null;
+  isGeoEstimated: boolean;
+
+  usageType: 'Residential' | 'Commercial' | 'Datacenter' | 'Mobile' | 'Unknown';
+  usageTypeFa: string;
+  connectionType: 'VPN / Proxy Probable' | 'Direct Connection Probable' | 'Tor Exit Node' | 'Unknown';
+  connectionTypeFa: string;
+  isVpnOrProxyDetected: boolean | null;
+  isDatacenter: boolean | null;
+
+  fraudRiskScore: number | null;
+  riskFactorsFa: string[];
+  fraudStatusFa: string;
+  fraudStatusEn: string;
   blacklistDetails: IpBlacklistDetails;
   userIntentAnalysisFa: string;
 }
@@ -42,35 +101,42 @@ export interface DnsResolver {
   id: string;
   name: string;
   primaryIp: string;
+  asn?: string;
+  isp?: string;
   location: string;
   status: string;
-  responseTimeMs: number;
-  isEncryptedDoH: boolean;
+  responseTimeMs: number | null;
+  isEncryptedDoH: boolean | null;
+  observationMethod: 'authoritative_dns_log' | 'doh_trace_observation' | 'server_system_resolver';
 }
 
-export interface DnsLeakResult {
-  status: TestStatus;
+export interface DnsLeakResult extends StandardTestMetadata {
+  runId: string;
+  authoritativeConfigured: boolean;
   detectedResolversCount: number;
   resolvers: DnsResolver[];
-  isLeaking: boolean;
+  isLeaking: boolean | null;
   messageFa: string;
   messageEn: string;
 }
 
 export interface WebRtcCandidate {
   ip: string;
-  type: 'host' | 'srflx' | 'relay';
+  version: 'IPv4' | 'IPv6' | 'mDNS';
+  type: 'host' | 'srflx' | 'relay' | 'prflx' | 'unknown';
   protocol: string;
   port: number;
   isLocalLanIp: boolean;
+  isPublicIp: boolean;
 }
 
-export interface WebRtcLeakResult {
-  status: TestStatus;
+export interface WebRtcLeakResult extends StandardTestMetadata {
   isSupported: boolean;
+  stunServersUsed: string[];
   localIps: string[];
+  mdnsHosts: string[];
   publicCandidates: string[];
-  isLeakingRealIp: boolean;
+  isLeakingRealIp: boolean | null;
   candidates: WebRtcCandidate[];
   messageFa: string;
   messageEn: string;
@@ -78,21 +144,21 @@ export interface WebRtcLeakResult {
 
 export interface VpnProtocolDetails {
   name: string;
-  code: 'wireguard' | 'openvpn' | 'l2tp' | 'v2ray' | 'direct';
+  code: 'wireguard' | 'openvpn' | 'l2tp' | 'v2ray' | 'direct' | 'unknown_protocol';
+  isProvableFromBrowser: boolean;
   encryptionNameFa: string;
-  estimatedMtu: number;
+  estimatedMtu: number | null;
   obfuscationStatusFa: string;
   descriptionFa: string;
 }
 
-export interface VpnProxyResult {
-  status: TestStatus;
-  score: number;
-  isDatacenterIp: boolean;
-  isTorNode: boolean;
-  isKnownProxy: boolean;
-  mismatchDnsCountry: boolean;
-  encryptionStrength: 'عالی (ChaCha20 / AES-256)' | 'قوی (AES-256-GCM)' | 'متوسط (L2TP/IPsec)' | 'پایین / ضعیف';
+export interface VpnProxyResult extends StandardTestMetadata {
+  score: number | null;
+  isDatacenterIp: boolean | null;
+  isTorNode: boolean | null;
+  isKnownProxy: boolean | null;
+  mismatchDnsCountry: boolean | null;
+  encryptionStrength: string;
   protocolType: string;
   protocolDetails: VpnProtocolDetails;
   messageFa: string;
@@ -103,10 +169,11 @@ export interface OptimalVpnNodeSuggestion {
   recommendedCountryNameFa: string;
   recommendedCountryCode: string;
   recommendedCityFa: string;
-  estimatedPingMs: number;
-  privacyRatingFa: 'عالی (قوانین حریم خصوصی GDPR)' | 'بسیار خوب' | 'متوسط';
+  estimatedPingMs: number | null;
+  privacyRatingFa: string;
   recommendationReasonFa: string;
   recommendedProtocolsFa: string[];
+  isHeuristicSuggestion: boolean;
 }
 
 export interface EncryptedDnsRecommendation {
@@ -116,26 +183,31 @@ export interface EncryptedDnsRecommendation {
   dohUrl: string;
   primaryIp: string;
   secondaryIp: string;
-  estimatedPingMs: number;
+  estimatedPingMs: number | null;
   unfilteredStatusFa: string;
   featuresFa: string[];
 }
 
-export interface NetworkMetrics {
-  pingMs: number;
-  jitterMs: number;
-  downloadMbps: number;
-  packetLossPercent: number;
+export interface NetworkMetrics extends StandardTestMetadata {
+  measurementMethod: 'HTTP_RTT';
+  pingMs: number | null;
+  jitterMs: number | null;
+  downloadMbps: number | null;
+  packetLossPercent: number | null;
+  probesSent: number;
+  probesReceived: number;
+  bytesTransferred: number;
+  durationMs: number;
   pingSamples: number[];
-  stabilityScore: number;
-  stabilityStatusFa: 'پایدار و عالی' | 'دارای نوسان جزئی' | 'ناپایدار (Jitter بالا)';
+  stabilityScore: number | null;
+  stabilityStatusFa: string;
   testingPing: boolean;
   testingSpeed: boolean;
 }
 
 export interface AiAuditReport {
-  riskScore: number;
-  statusLevel: 'امن' | 'هشدار' | 'خطر نشت';
+  riskScore: number | null;
+  statusLevel: 'امن' | 'هشدار' | 'خطر نشت' | 'نامشخص';
   summaryFa: string;
   detailedAnalysisFa: string[];
   threatsFoundFa: string[];
@@ -143,6 +215,7 @@ export interface AiAuditReport {
   optimalNodeSuggestion?: OptimalVpnNodeSuggestion;
   dnsRecommendations?: EncryptedDnsRecommendation[];
   aiAvailable: boolean;
+  generatedAt?: string;
 }
 
 export interface FullNetworkTestReport {
@@ -156,5 +229,6 @@ export interface FullNetworkTestReport {
   optimalNodeSuggestion?: OptimalVpnNodeSuggestion;
   dnsRecommendations?: EncryptedDnsRecommendation[];
   overallStatus: TestStatus;
-  privacyScore: number;
+  privacyScore: number | null;
+  isScoreCalculable: boolean;
 }
