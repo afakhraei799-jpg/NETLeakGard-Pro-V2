@@ -1,0 +1,18 @@
+<svg width="512" height="512" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a" />
+      <stop offset="50%" stop-color="#082f49" />
+      <stop offset="100%" stop-color="#020617" />
+    </linearGradient>
+    <linearGradient id="shieldGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#06b6d4" />
+      <stop offset="50%" stop-color="#00f5d4" />
+      <stop offset="100%" stop-color="#10b981" />
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="92" height="92" rx="24" fill="url(#bgGrad)" stroke="#1e293b" stroke-width="3" />
+  <path d="M50 18 L76 28 V52 C76 68 64 80 50 85 C36 80 24 68 24 52 V28 L50 18 Z" fill="url(#shieldGrad)" fill-opacity="0.2" stroke="url(#shieldGrad)" stroke-width="4.5" stroke-linejoin="round" />
+  <path d="M32 50 Q50 60 68 50" fill="none" stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round" />
+  <polygon points="50,38 58,50 50,62 42,50" fill="#00f5d4" />
+</svg>

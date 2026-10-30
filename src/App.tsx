@@ -33,7 +33,19 @@ import { ExportModal } from './components/ExportModal';
 import { EduGuideModal } from './components/EduGuideModal';
 import { SettingsModal } from './components/SettingsModal';
 import { LogoDownloadModal } from './components/LogoDownloadModal';
-import { ShieldCheck, Sparkles, Image as ImageIcon } from 'lucide-react';
+import { PWAInstallModal } from './components/PWAInstallModal';
+import { MobileBottomNav } from './components/MobileBottomNav';
+import { useOnlineStatus } from './hooks/useOnlineStatus';
+import {
+  ShieldCheck,
+  Sparkles,
+  Image as ImageIcon,
+  Monitor,
+  Smartphone,
+  WifiOff,
+  Keyboard,
+  Download
+} from 'lucide-react';
 
 const LOCAL_STORAGE_HISTORY_KEY = 'leakguard_score_history';
 
@@ -43,11 +55,14 @@ export default function App() {
   const [autoRun, setAutoRun] = useState<boolean>(true);
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
 
+  const isOnline = useOnlineStatus();
+
   // Modal states
   const [isHelpOpen, setIsHelpOpen] = useState<boolean>(false);
   const [isExportOpen, setIsExportOpen] = useState<boolean>(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
   const [isLogoOpen, setIsLogoOpen] = useState<boolean>(false);
+  const [isInstallOpen, setIsInstallOpen] = useState<boolean>(false);
 
   // Network State
   const [ipDetails, setIpDetails] = useState<IpDetails | null>(null);
@@ -237,6 +252,7 @@ export default function App() {
       // Step 6: Gemini AI Audit Synthesis
       const auditRes = await fetchAiAudit({
         ip: ipData.ip,
+        ipDetails: ipData,
         countryName: ipData.countryName,
         city: ipData.city,
         isp: ipData.isp,
@@ -269,6 +285,27 @@ export default function App() {
     }
   }, [playLeakAlarmSound, playSuccessSound]);
 
+  // Windows Desktop Keyboard Shortcuts (Alt + R, Alt + E, Alt + S, Alt + H)
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.altKey && e.key.toLowerCase() === 'r') {
+        e.preventDefault();
+        if (!isTesting) runFullLeakSuite();
+      } else if (e.altKey && e.key.toLowerCase() === 'e') {
+        e.preventDefault();
+        setIsExportOpen(prev => !prev);
+      } else if (e.altKey && e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        setIsSettingsOpen(prev => !prev);
+      } else if (e.altKey && e.key.toLowerCase() === 'h') {
+        e.preventDefault();
+        setIsHelpOpen(prev => !prev);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isTesting, runFullLeakSuite]);
+
   // Initial Auto-run on boot
   useEffect(() => {
     if (autoRun) {
@@ -292,8 +329,20 @@ export default function App() {
   const isFa = lang === 'fa';
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-cyan-500 selection:text-slate-950">
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-cyan-500 selection:text-slate-950 pb-20 md:pb-0">
       
+      {/* Offline Connectivity Banner */}
+      {!isOnline && (
+        <div className="bg-amber-500 text-slate-950 px-4 py-2 text-xs font-extrabold flex items-center justify-center gap-2 z-50 shadow-lg">
+          <WifiOff className="w-4 h-4 animate-pulse" />
+          <span>
+            {isFa
+              ? 'حالت آفلاین فعال است — اتصال اینترنت برقرار نیست؛ آخرین گزارش ذخیره شده در کش نمایش داده می‌شود.'
+              : 'Offline Mode — Using cached network security report.'}
+          </span>
+        </div>
+      )}
+
       {/* Top Header */}
       <Header
         lang={lang}
@@ -303,10 +352,41 @@ export default function App() {
         onOpenHelp={() => setIsHelpOpen(true)}
         onOpenExport={() => setIsExportOpen(true)}
         onOpenSettings={() => setIsSettingsOpen(true)}
+        onOpenInstallModal={() => setIsInstallOpen(true)}
       />
 
+      {/* Windows & Android Native Optimization Bar */}
+      <div className="bg-slate-900/70 border-b border-slate-800/80 px-4 md:px-8 py-2">
+        <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-300">
+          <div className="flex items-center gap-3">
+            <span className="inline-flex items-center gap-1.5 text-cyan-400 font-bold">
+              <Monitor className="w-3.5 h-3.5" />
+              <span>{isFa ? 'نسخه ویندوز ۱۰/۱۱' : 'Windows 10/11 Ready'}</span>
+            </span>
+            <span className="text-slate-700">|</span>
+            <span className="inline-flex items-center gap-1.5 text-emerald-400 font-bold">
+              <Smartphone className="w-3.5 h-3.5" />
+              <span>{isFa ? 'نسخه موبایل اندروید (WebAPK)' : 'Android WebAPK Ready'}</span>
+            </span>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <div className="hidden lg:flex items-center gap-1.5 text-slate-400">
+              <Keyboard className="w-3.5 h-3.5 text-amber-400" />
+              <span>{isFa ? 'میانبرهای ویندوز: Alt+R (تست) • Alt+E (خروجی) • Alt+S (تنظیمات)' : 'Hotkeys: Alt+R (Test) • Alt+E (Export) • Alt+S (Settings)'}</span>
+            </div>
+            <button
+              onClick={() => setIsInstallOpen(true)}
+              className="text-cyan-300 hover:text-cyan-200 underline font-bold cursor-pointer"
+            >
+              {isFa ? 'راهنمای نصب ویندوز و اندروید' : 'Install Guide'}
+            </button>
+          </div>
+        </div>
+      </div>
+
       {/* Main Content Viewport */}
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 md:px-8 py-8 space-y-8">
+      <main className="flex-1 max-w-7xl w-full mx-auto px-3 sm:px-6 md:px-8 py-6 md:py-8 space-y-6 md:space-y-8">
         
         {/* Hero Privacy Score Banner */}
         <HeroScoreBanner
@@ -336,34 +416,47 @@ export default function App() {
         </section>
 
         {/* Leak Test Cards Grid */}
-        <section id="test-results" className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+        <section id="test-results" className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5 md:gap-6">
           <IpLeakCard ipDetails={ipDetails} lang={lang} />
           <DnsLeakCard dnsLeak={dnsLeak} lang={lang} />
           <WebRtcCard webRtcLeak={webRtcLeak} lang={lang} />
           <VpnProxyCard vpnProxy={vpnProxy} lang={lang} />
           <SpeedPingCard metrics={metrics} onUpdateMetrics={setMetrics} lang={lang} />
           
-          {/* Quick Info & Logo Download Box */}
-          <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 shadow-3d-card flex flex-col justify-between hover:border-slate-700 transition-colors">
-            <div>
-              <div className="flex items-center gap-2.5 text-cyan-400 mb-3 font-bold text-sm">
-                <Sparkles className="w-5 h-5 text-cyan-400" />
-                <span>{isFa ? 'لوگوی رسمی و امنیت شبکه' : 'Network Privacy & Branding'}</span>
+          {/* Windows & Android Branding & App Center Card */}
+          <div className="relative bg-slate-900/90 border border-slate-800/80 rounded-3xl overflow-hidden shadow-3d-card flex flex-col justify-between hover:border-cyan-500/40 transition-colors">
+            <div className="h-1.5 w-full bg-gradient-to-r from-cyan-400 via-teal-400 to-emerald-500" />
+            <div className="p-6 flex-1 flex flex-col justify-between">
+              <div>
+                <div className="flex items-center gap-2.5 text-cyan-400 mb-3 font-extrabold text-sm">
+                  <Sparkles className="w-5 h-5 text-cyan-400" />
+                  <span>{isFa ? 'مرکز نصب و آیکون (ویندوز و اندروید)' : 'Windows & Android App Center'}</span>
+                </div>
+                <p className="text-xs text-slate-300 leading-relaxed mb-4">
+                  {isFa 
+                    ? 'نرم‌افزار LeakGuard برای اجرای مستقل روی دسکتاپ ویندوز ۱۰/۱۱ (همراه با کلیدهای میانبر) و گوشی‌های اندروید (با نوار ناوبری لمسی پایین صفحه و آیکون تطبیقی) بهینه‌سازی شده است.'
+                    : 'LeakGuard is optimized for standalone Windows 10/11 desktop execution and Android mobile devices with touch navigation.'}
+                </p>
               </div>
-              <p className="text-xs text-slate-300 leading-relaxed mb-4">
-                {isFa 
-                  ? 'لوگوی برداری برنامه طبق استانداردهای Material You و Fluent Design برپایه نماد سپر ۳D و خطوط کره زمین برای استفاده در نسخه‌های اندروید و ویندوز طراحی شده است.'
-                  : 'Official vector app icon designed for Android APK and Windows desktop app releases.'}
-              </p>
+              
+              <div className="space-y-2.5">
+                <button
+                  onClick={() => setIsInstallOpen(true)}
+                  className="w-full py-2.5 bg-gradient-to-r from-emerald-600 to-teal-500 hover:from-emerald-500 hover:to-teal-400 text-slate-950 rounded-xl text-xs font-black transition-all flex items-center justify-center gap-2 shadow-md cursor-pointer"
+                >
+                  <Download className="w-4 h-4" />
+                  <span>{isFa ? 'نصب مستقیم روی ویندوز و اندروید' : 'Install on Windows & Android'}</span>
+                </button>
+
+                <button
+                  onClick={() => setIsLogoOpen(true)}
+                  className="w-full py-2.5 bg-slate-950 hover:bg-slate-800 text-cyan-300 rounded-xl text-xs font-bold transition-all border border-slate-800 flex items-center justify-center gap-2 cursor-pointer"
+                >
+                  <ImageIcon className="w-4 h-4 text-cyan-400" />
+                  <span>{isFa ? 'دریافت آیکون SVG (Android & Windows)' : 'Download App Icons (SVG)'}</span>
+                </button>
+              </div>
             </div>
-            
-            <button
-              onClick={() => setIsLogoOpen(true)}
-              className="w-full py-2.5 bg-gradient-to-r from-cyan-950 to-emerald-950 hover:from-cyan-900 hover:to-emerald-900 text-cyan-300 rounded-xl text-xs font-bold transition-all border border-cyan-800/80 flex items-center justify-center gap-2"
-            >
-              <ImageIcon className="w-4 h-4 text-cyan-400" />
-              <span>{isFa ? 'دانلود لوگو و آیکون (Android & Windows)' : 'Download Logo (Android & Windows)'}</span>
-            </button>
           </div>
         </section>
 
@@ -377,16 +470,25 @@ export default function App() {
         <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-4">
           <div className="flex items-center gap-2">
             <ShieldCheck className="w-4 h-4 text-cyan-400" />
-            <span>{t.brandName} © {new Date().getFullYear()} - {isFa ? 'طراحی و پیاده‌سازی کامل به زبان فارسی' : 'Full Persian Localization & VPN Auditor'}</span>
+            <span>{t.brandName} © {new Date().getFullYear()} - {isFa ? 'بهینه‌سازی شده برای ویندوز و اندروید' : 'Optimized for Windows & Android'}</span>
           </div>
-          <div className="flex items-center gap-4 text-slate-400">
-            <button onClick={() => setIsLogoOpen(true)} className="hover:text-cyan-400 transition-colors">{isFa ? 'لوگوی برنامه' : 'App Logo'}</button>
-            <button onClick={() => setIsHelpOpen(true)} className="hover:text-white transition-colors">{t.helpGuide}</button>
-            <button onClick={() => setIsSettingsOpen(true)} className="hover:text-white transition-colors">{t.settings}</button>
-            <button onClick={() => setIsExportOpen(true)} className="hover:text-white transition-colors">{t.exportReport}</button>
+          <div className="flex flex-wrap items-center justify-center gap-4 text-slate-400">
+            <button onClick={() => setIsInstallOpen(true)} className="hover:text-emerald-400 transition-colors cursor-pointer">{isFa ? 'نصب برنامه' : 'Install App'}</button>
+            <button onClick={() => setIsLogoOpen(true)} className="hover:text-cyan-400 transition-colors cursor-pointer">{isFa ? 'لوگوی برنامه' : 'App Logo'}</button>
+            <button onClick={() => setIsHelpOpen(true)} className="hover:text-white transition-colors cursor-pointer">{t.helpGuide}</button>
+            <button onClick={() => setIsSettingsOpen(true)} className="hover:text-white transition-colors cursor-pointer">{t.settings}</button>
+            <button onClick={() => setIsExportOpen(true)} className="hover:text-white transition-colors cursor-pointer">{t.exportReport}</button>
           </div>
         </div>
       </footer>
+
+      {/* Android Mobile Bottom Navigation Bar */}
+      <MobileBottomNav
+        lang={lang}
+        isTesting={isTesting}
+        onStartTest={runFullLeakSuite}
+        onOpenInstallModal={() => setIsInstallOpen(true)}
+      />
 
       {/* Modals */}
       <ExportModal
@@ -418,6 +520,12 @@ export default function App() {
       <LogoDownloadModal
         isOpen={isLogoOpen}
         onClose={() => setIsLogoOpen(false)}
+        lang={lang}
+      />
+
+      <PWAInstallModal
+        isOpen={isInstallOpen}
+        onClose={() => setIsInstallOpen(false)}
         lang={lang}
       />
 

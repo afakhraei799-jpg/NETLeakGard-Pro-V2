@@ -3,6 +3,7 @@ import { RefreshCw, Languages, HelpCircle, FileText, Settings as SettingsIcon, R
 import { Language } from '../types/network';
 import { translations } from '../i18n/translations';
 import { AppLogoIcon } from './AppLogoIcon';
+import { PWAInstallButton } from './PWAInstallModal';
 
 interface HeaderProps {
   lang: Language;
@@ -12,6 +13,7 @@ interface HeaderProps {
   onOpenHelp: () => void;
   onOpenExport: () => void;
   onOpenSettings: () => void;
+  onOpenInstallModal: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -22,24 +24,25 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenHelp,
   onOpenExport,
   onOpenSettings,
+  onOpenInstallModal,
 }) => {
   const t = translations[lang];
 
   return (
-    <header className="sticky top-0 z-40 bg-slate-950/85 backdrop-blur-xl border-b border-slate-800/80 px-4 md:px-8 py-3.5 transition-all shadow-xl">
-      <div className="max-w-7xl mx-auto flex items-center justify-between gap-6">
+    <header className="sticky top-0 z-40 bg-slate-950/90 backdrop-blur-xl border-b border-slate-800/80 px-3 sm:px-6 md:px-8 py-3 transition-all shadow-xl select-none">
+      <div className="max-w-7xl mx-auto flex items-center justify-between gap-3 sm:gap-6">
         
         {/* Zone 1: Single Element Brand Wordmark lockup with AppLogoIcon */}
-        <div className="flex items-center gap-3 shrink-0">
-          <AppLogoIcon className="w-11 h-11" size={44} />
+        <div className="flex items-center gap-2.5 sm:gap-3 shrink-0">
+          <AppLogoIcon className="w-10 h-10 sm:w-11 sm:h-11" size={42} />
           <div>
             <div className="flex items-center gap-2">
-              <h1 className="text-lg font-extrabold tracking-tight text-white whitespace-nowrap">
+              <h1 className="text-base sm:text-lg font-extrabold tracking-tight text-white whitespace-nowrap">
                 {t.brandName}
               </h1>
-              <span className="hidden sm:inline-flex items-center gap-1 bg-cyan-950/80 border border-cyan-800/60 text-cyan-300 text-[10px] font-bold px-2 py-0.5 rounded-full">
+              <span className="hidden xl:inline-flex items-center gap-1 bg-cyan-950/80 border border-cyan-800/60 text-cyan-300 text-[10px] font-bold px-2 py-0.5 rounded-full">
                 <Radio className="w-2.5 h-2.5 text-cyan-400 animate-pulse" />
-                <span>Android & Windows App</span>
+                <span>Windows & Android</span>
               </span>
             </div>
             <p className="text-[11px] text-slate-400 hidden sm:block whitespace-nowrap">
@@ -48,8 +51,8 @@ export const Header: React.FC<HeaderProps> = ({
           </div>
         </div>
 
-        {/* Zone 2: Navigation Links */}
-        <nav className="hidden lg:flex items-center gap-6 text-sm font-semibold text-slate-300">
+        {/* Zone 2: Navigation Links (Windows & Desktop View) */}
+        <nav className="hidden lg:flex items-center gap-5 text-xs font-bold text-slate-300">
           <a href="#test-results" className="hover:text-cyan-400 transition-colors whitespace-nowrap shrink-0">
             {lang === 'fa' ? 'نتایج آزمایش‌ها' : 'Test Results'}
           </a>
@@ -58,14 +61,14 @@ export const Header: React.FC<HeaderProps> = ({
           </a>
           <button 
             onClick={onOpenHelp}
-            className="hover:text-cyan-400 transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5"
+            className="hover:text-cyan-400 transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
           >
             <HelpCircle className="w-4 h-4 text-slate-400" />
             <span>{t.helpGuide}</span>
           </button>
           <button 
             onClick={onOpenExport}
-            className="hover:text-cyan-400 transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5"
+            className="hover:text-cyan-400 transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
           >
             <FileText className="w-4 h-4 text-slate-400" />
             <span>{t.exportReport}</span>
@@ -73,21 +76,25 @@ export const Header: React.FC<HeaderProps> = ({
         </nav>
 
         {/* Zone 3: Key Primary Action Controls */}
-        <div className="flex items-center gap-2.5 shrink-0">
+        <div className="flex items-center gap-2 shrink-0">
           
+          {/* In-App Install Button for Windows & Android */}
+          <PWAInstallButton lang={lang} onOpenInstallModal={onOpenInstallModal} />
+
           <button
             onClick={onStartFullTest}
             disabled={isTesting}
-            className="flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-cyan-500 via-teal-400 to-cyan-500 hover:from-cyan-400 hover:to-teal-300 text-slate-950 text-xs font-black rounded-2xl shadow-[0_0_20px_rgba(6,182,212,0.4)] hover:shadow-[0_0_25px_rgba(6,182,212,0.6)] hover:scale-105 active:scale-95 transition-all disabled:opacity-50 uppercase tracking-wide cursor-pointer"
+            className="flex items-center gap-2 px-3.5 sm:px-5 py-2 sm:py-2.5 bg-gradient-to-r from-cyan-500 via-teal-400 to-cyan-500 hover:from-cyan-400 hover:to-teal-300 text-slate-950 text-xs font-black rounded-2xl shadow-[0_0_20px_rgba(6,182,212,0.4)] hover:shadow-[0_0_25px_rgba(6,182,212,0.6)] hover:scale-105 active:scale-95 transition-all disabled:opacity-50 uppercase tracking-wide cursor-pointer"
+            title={lang === 'fa' ? 'میانبر ویندوز: Alt + R' : 'Windows Hotkey: Alt + R'}
           >
             <RefreshCw className={`w-4 h-4 ${isTesting ? 'animate-spin' : ''}`} />
             <span className="hidden sm:inline">{isTesting ? t.testingProgress : t.startFullTest}</span>
-            <span className="sm:hidden">{isTesting ? '...' : (lang === 'fa' ? 'تست شبکه' : 'TEST')}</span>
+            <span className="sm:hidden">{isTesting ? '...' : (lang === 'fa' ? 'تست' : 'TEST')}</span>
           </button>
 
           <button
             onClick={onToggleLang}
-            className="p-2.5 bg-slate-900/90 hover:bg-slate-800 text-cyan-300 rounded-2xl border border-slate-800 transition-all font-bold text-xs"
+            className="p-2 sm:p-2.5 bg-slate-900/90 hover:bg-slate-800 text-cyan-300 rounded-2xl border border-slate-800 transition-all font-bold text-xs cursor-pointer"
             title="تغییر زبان / Language"
           >
             <Languages className="w-4 h-4" />
@@ -95,8 +102,8 @@ export const Header: React.FC<HeaderProps> = ({
 
           <button
             onClick={onOpenSettings}
-            className="p-2.5 bg-slate-900/90 hover:bg-slate-800 text-slate-300 hover:text-white rounded-2xl border border-slate-800 transition-all"
-            title={t.settings}
+            className="p-2 sm:p-2.5 bg-slate-900/90 hover:bg-slate-800 text-slate-300 hover:text-white rounded-2xl border border-slate-800 transition-all cursor-pointer"
+            title={`${t.settings} (Alt + S)`}
           >
             <SettingsIcon className="w-4 h-4" />
           </button>
