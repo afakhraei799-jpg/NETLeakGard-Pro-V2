@@ -16,6 +16,7 @@ import {
   isGloballyRoutablePublicIp,
   isPrivateOrLocalAddress,
   isSafeExternalUrl,
+  isValidDnsLeakBaseDomain,
   isValidDnsObservationRecord,
   isValidDnsRunId,
   parseDnsLeakProbeQname,
@@ -699,13 +700,15 @@ app.get('/api/ip-info', rateLimit(30, 60_000, 'ip-info'), async (req, res) => {
 
 // 1.5 Endpoint: Configuration & Health Check (Zero secret exposure, never crashes on missing optional keys)
 app.get('/api/health', (_req, res) => {
-  const dnsLeakDomain = (process.env.DNS_LEAK_DOMAIN || '').trim();
+  const dnsLeakDomain = (process.env.DNS_LEAK_DOMAIN || '').trim().toLowerCase().replace(/^\.+|\.+$/g, '');
   const collectorApiUrl = (process.env.DNS_COLLECTOR_API_URL || '').trim();
   const collectorToken = (process.env.DNS_COLLECTOR_API_TOKEN || '').trim();
+  const udp53Verified = (process.env.DNS_UDP53_VERIFIED || '').trim().toLowerCase() === 'true';
   const missingDnsEnvVars: string[] = [];
-  if (!dnsLeakDomain) missingDnsEnvVars.push('DNS_LEAK_DOMAIN');
+  if (!dnsLeakDomain || !isValidDnsLeakBaseDomain(dnsLeakDomain)) missingDnsEnvVars.push('DNS_LEAK_DOMAIN');
   if (!collectorApiUrl) missingDnsEnvVars.push('DNS_COLLECTOR_API_URL');
   if (!collectorToken) missingDnsEnvVars.push('DNS_COLLECTOR_API_TOKEN');
+  if (!udp53Verified) missingDnsEnvVars.push('DNS_UDP53_VERIFIED=true');
 
   res.json({
     ok: true,
@@ -728,14 +731,16 @@ app.get('/api/dns-leak-probe', rateLimit(30, 60_000, 'dns-leak-probe'), async (r
       ? req.query.runId
       : crypto.randomUUID();
 
-  const dnsLeakDomain = (process.env.DNS_LEAK_DOMAIN || '').trim();
+  const dnsLeakDomain = (process.env.DNS_LEAK_DOMAIN || '').trim().toLowerCase().replace(/^\.+|\.+$/g, '');
   const collectorApiUrl = (process.env.DNS_COLLECTOR_API_URL || '').trim();
   const collectorToken = (process.env.DNS_COLLECTOR_API_TOKEN || '').trim();
+  const udp53Verified = (process.env.DNS_UDP53_VERIFIED || '').trim().toLowerCase() === 'true';
 
   const missingEnvVars: string[] = [];
-  if (!dnsLeakDomain) missingEnvVars.push('DNS_LEAK_DOMAIN');
+  if (!dnsLeakDomain || !isValidDnsLeakBaseDomain(dnsLeakDomain)) missingEnvVars.push('DNS_LEAK_DOMAIN');
   if (!collectorApiUrl) missingEnvVars.push('DNS_COLLECTOR_API_URL');
   if (!collectorToken) missingEnvVars.push('DNS_COLLECTOR_API_TOKEN');
+  if (!udp53Verified) missingEnvVars.push('DNS_UDP53_VERIFIED=true');
 
   const authoritativeConfigured = missingEnvVars.length === 0;
 
@@ -755,7 +760,7 @@ app.get('/api/dns-leak-probe', rateLimit(30, 60_000, 'dns-leak-probe'), async (r
         serverSystemResolvers: serverSystemDns,
         resolvers: [],
         messageFa:
-          `وضعیت: پیکربندی نشده — متغیرهای محیطی (${missingEnvVars.join('، ')}) تنظیم نشده‌اند. بدون سرور Authoritative DNS اختصاصی، هیچ نتیجه‌ای به عنوان موفق یا امن جعل نمی‌شود.`,
+          `وضعیت: پیکربندی نشده — متغیرهای محیطی (${missingEnvVars.join('، ')}) تنظیم یا تأیید نشده‌اند. بدون سرور Authoritative DNS اختصاصی و تأیید عملی UDP/53، هیچ نتیجه‌ای به عنوان موفق یا امن جعل نمی‌شود.`,
       });
     }
 

@@ -43,6 +43,7 @@ import {
   COMMON_SENSITIVE_PORTS,
   canonicalizeIp,
   isGloballyRoutablePublicIp,
+  isValidDnsLeakBaseDomain,
   isValidDnsObservationRecord,
   isValidDnsRunId,
   parseDnsLeakProbeQname,
@@ -263,7 +264,7 @@ function isAuthoritativeDnsFullyConfigured(env: Env): {
   const hasKv = Boolean(env.DNS_LOGS_KV && typeof env.DNS_LOGS_KV.get === 'function');
 
   const missingVars: string[] = [];
-  if (!domain) missingVars.push('DNS_LEAK_DOMAIN');
+  if (!domain || !isValidDnsLeakBaseDomain(domain)) missingVars.push('DNS_LEAK_DOMAIN');
   if (!hasKv) missingVars.push('DNS_LOGS_KV');
   if (!token) missingVars.push('DNS_COLLECTOR_API_TOKEN');
   if (!udp53Verified) missingVars.push('DNS_UDP53_VERIFIED=true');
@@ -271,7 +272,7 @@ function isAuthoritativeDnsFullyConfigured(env: Env): {
   return {
     configured: missingVars.length === 0,
     missingVars,
-    dnsLeakDomain: domain || null,
+    dnsLeakDomain: domain && isValidDnsLeakBaseDomain(domain) ? domain : null,
   };
 }
 
