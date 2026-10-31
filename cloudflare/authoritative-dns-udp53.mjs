@@ -28,6 +28,8 @@
 import dgram from 'node:dgram';
 import https from 'node:https';
 import http from 'node:http';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 
 const DNS_LEAK_DOMAIN = (process.env.DNS_LEAK_DOMAIN || '').trim().toLowerCase().replace(/^\.+|\.+$/g, '');
 const WORKER_INGEST_URL = (process.env.WORKER_INGEST_URL || '').trim();
@@ -35,20 +37,20 @@ const DNS_COLLECTOR_API_TOKEN = (process.env.DNS_COLLECTOR_API_TOKEN || '').trim
 const UDP_PORT = Number(process.env.UDP_PORT || 53);
 const BIND_ADDRESS = process.env.BIND_ADDRESS || '0.0.0.0';
 
-if (!DNS_LEAK_DOMAIN || !WORKER_INGEST_URL || !DNS_COLLECTOR_API_TOKEN) {
-  console.error(
-    '[Authoritative-UDP53] خطا: متغیرهای محیطی DNS_LEAK_DOMAIN، WORKER_INGEST_URL و DNS_COLLECTOR_API_TOKEN باید تنظیم شوند.'
-  );
-  process.exit(1);
-}
-
-const VALID_RUN_ID_REGEX = /^[a-zA-Z0-9-]{8,64}$/;
+const DNS_SINGLE_LABEL_REGEX = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
+const DNS_PROBE_LABEL_REGEX = /^p([1-9][0-9]?)$/i;
+const VALID_RUN_ID_REGEX = /^[a-z0-9](?:[a-z0-9-]{6,61}[a-z0-9])$/i;
+const PREFIXED_UUID_TRAP_REGEX = /^p[0-9]+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * استخراج نام دامنهٔ استعلام‌شده (QNAME) از بستهٔ باینری DNS طبق RFC 1035
  */
-function parseDnsQname(msg) {
+export function parseDnsQname(msg) {
   if (!Buffer.isBuffer(msg) || msg.length < 17) return null;
+  const flags = msg.readUInt16BE(2);
+  // بسته‌هایی که بیت QR=1 دارند (پاسخ DNS هستند نه پرس‌وجو) نباید پردازش شوند
+  if ((flags & 0x8000) !== 0) return null;
+
   const qdCount = msg.readUInt16BE(4);
   if (qdCount < 1) return null;
 
@@ -60,20 +62,24 @@ function parseDnsQname(msg) {
       offset += 1;
       break;
     }
-    // عدم پذیرش پوینترهای فشرده‌سازی در بخش Question اول برای جلوگیری از حلقه
-    if ((len & 0xc0) !== 0) return null;
+    // عدم پذیرش پوینترهای فشرده‌سازی در بخش Question اول برای جلوگیری از حلقه و رعایت طول برچسب RFC 1035 (1..63)
+    if ((len & 0xc0) !== 0 || len > 63) return null;
     if (offset + 1 + len > msg.length) return null;
     const label = msg.subarray(offset + 1, offset + 1 + len).toString('ascii');
+    if (!DNS_SINGLE_LABEL_REGEX.test(label)) return null;
     labels.push(label);
     offset += 1 + len;
     if (labels.length > 16) return null;
   }
 
   if (offset + 4 > msg.length || labels.length === 0) return null;
+  const qname = labels.join('.').toLowerCase();
+  if (qname.length > 253) return null;
+
   const qtype = msg.readUInt16BE(offset);
   const qclass = msg.readUInt16BE(offset + 2);
   return {
-    qname: labels.join('.').toLowerCase(),
+    qname,
     labels: labels.map(l => l.toLowerCase()),
     qtype,
     qclass,
@@ -82,28 +88,36 @@ function parseDnsQname(msg) {
 }
 
 /**
- * ساخت بستهٔ پاسخ DNS حداقلی (NOERROR، Authoritative Answer، بدون رکورد اضافی یا همراه با A=127.0.0.1 برای جلوگیری از Timeout کلاینت)
+ * ساخت بستهٔ پاسخ DNS طبق RFC 1035 با کد وضعیت (RCODE) و بیت Authoritative (AA) مشخص
+ * - RCODE=0 (NOERROR): برای QTYPE=1 (A) رکورد A=0.0.0.0 با TTL=10s برمی‌گرداند و برای سایر انواع مجاز (مانند AAAA) پاسخ NODATA (ANCOUNT=0) می‌دهد.
+ * - RCODE=1 (FORMERR)، RCODE=3 (NXDOMAIN)، RCODE=4 (NOTIMP)، RCODE=5 (REFUSED)
  */
-function buildMinimalDnsResponse(queryBuf, questionEndOffset, qtype) {
+export function buildMinimalDnsResponse(queryBuf, questionEndOffset, qtype, rcode = 0, authoritative = true) {
   const txId = queryBuf.readUInt16BE(0);
   const reqFlags = queryBuf.readUInt16BE(2);
   const rdBit = reqFlags & 0x0100;
-  // QR=1 (0x8000), AA=1 (0x0400), RCODE=0 (NOERROR)
-  const respFlags = 0x8400 | rdBit;
+  const aaBit = authoritative ? 0x0400 : 0x0000;
+  const safeRcode = rcode & 0x000f;
+  // QR=1 (0x8000) | AA | RD | RCODE
+  const respFlags = 0x8000 | aaBit | rdBit | safeRcode;
 
-  const questionSection = queryBuf.subarray(12, questionEndOffset);
-  const includeARecord = qtype === 1; // A record query
+  const hasValidQuestion =
+    typeof questionEndOffset === 'number' &&
+    questionEndOffset > 12 &&
+    questionEndOffset <= queryBuf.length;
+  const questionSection = hasValidQuestion ? queryBuf.subarray(12, questionEndOffset) : Buffer.alloc(0);
+  const includeARecord = safeRcode === 0 && authoritative && hasValidQuestion && qtype === 1;
 
   const header = Buffer.alloc(12);
   header.writeUInt16BE(txId, 0);
   header.writeUInt16BE(respFlags, 2);
-  header.writeUInt16BE(1, 4); // QDCOUNT = 1
+  header.writeUInt16BE(hasValidQuestion ? 1 : 0, 4); // QDCOUNT
   header.writeUInt16BE(includeARecord ? 1 : 0, 6); // ANCOUNT
   header.writeUInt16BE(0, 8); // NSCOUNT
   header.writeUInt16BE(0, 10); // ARCOUNT
 
   if (!includeARecord) {
-    return Buffer.concat([header, questionSection]);
+    return hasValidQuestion ? Buffer.concat([header, questionSection]) : header;
   }
 
   // پاسخ A رکورد با TTL=10 ثانیه به 0.0.0.0 صرفاً جهت بسته شدن سریع کوئری DNS
@@ -119,18 +133,171 @@ function buildMinimalDnsResponse(queryBuf, questionEndOffset, qtype) {
   return Buffer.concat([header, questionSection, answer]);
 }
 
+const SUPPORTED_DNS_QTYPES = new Set([
+  1,  // A
+  2,  // NS
+  6,  // SOA
+  16, // TXT
+  28, // AAAA
+  64, // SVCB
+  65, // HTTPS
+]);
+
 /**
- * استخراج شناسهٔ runId از زیردامنهٔ `<probe>.<runId>.<DNS_LEAK_DOMAIN>`
+ * ارزیابی کامل بستهٔ ورودی UDP/53 و تعیین پاسخ استاندارد RFC 1035 و شواهد معتبر
  */
-function extractRunIdFromQname(qname) {
-  const suffix = `.${DNS_LEAK_DOMAIN}`;
+export function evaluateDnsQueryPacket(msg, allowedDomain = DNS_LEAK_DOMAIN) {
+  if (!Buffer.isBuffer(msg) || msg.length < 12) {
+    return { ignore: true, rcode: null, responseBuffer: null, observation: null };
+  }
+
+  const flags = msg.readUInt16BE(2);
+  // ۱. نادیده گرفتن بسته‌های پاسخ (QR=1) جهت جلوگیری از حلقهٔ بازتاب UDP
+  if ((flags & 0x8000) !== 0) {
+    return { ignore: true, rcode: null, responseBuffer: null, observation: null };
+  }
+
+  // ۲. بررسی OPCODE استاندارد (OPCODE=0 برای QUERY)
+  const opcode = (flags >> 11) & 0x0f;
+  if (opcode !== 0) {
+    return {
+      ignore: false,
+      rcode: 4, // NOTIMP
+      responseBuffer: buildMinimalDnsResponse(msg, 0, 0, 4, false),
+      observation: null,
+    };
+  }
+
+  // ۳. تجزیهٔ بخش Question؛ در صورت ساختار معیوب، بازگرداندن FORMERR (RCODE=1)
+  const parsed = parseDnsQname(msg);
+  if (!parsed) {
+    return {
+      ignore: false,
+      rcode: 1, // FORMERR
+      responseBuffer: buildMinimalDnsResponse(msg, 0, 0, 1, false),
+      observation: null,
+    };
+  }
+
+  const normDomain = typeof allowedDomain === 'string'
+    ? allowedDomain.trim().toLowerCase().replace(/^\.+|\.+$/g, '')
+    : '';
+  const isInAllowedZone =
+    normDomain.length > 0 &&
+    (parsed.qname === normDomain || parsed.qname.endsWith(`.${normDomain}`));
+
+  // ۴. پرس‌وجوهای خارج از دامنهٔ مجاز تست -> REFUSED (RCODE=5, AA=0)
+  if (!isInAllowedZone) {
+    return {
+      ignore: false,
+      rcode: 5, // REFUSED
+      responseBuffer: buildMinimalDnsResponse(msg, parsed.questionEndOffset, parsed.qtype, 5, false),
+      observation: null,
+    };
+  }
+
+  // ۵. بررسی کلاس اینترنت (CLASS IN = 1) و انواع کوئری پشتیبانی‌شده؛ در غیر این صورت NOTIMP (RCODE=4)
+  if (parsed.qclass !== 1 || !SUPPORTED_DNS_QTYPES.has(parsed.qtype)) {
+    return {
+      ignore: false,
+      rcode: 4, // NOTIMP
+      responseBuffer: buildMinimalDnsResponse(msg, parsed.questionEndOffset, parsed.qtype, 4, true),
+      observation: null,
+    };
+  }
+
+  // ۶. بررسی تطابق نام پرس‌وجو با قالب استاندارد `p<N>.<runId>.<allowedDomain>`
+  const validatedQname = parseDnsLeakQname(parsed.qname, normDomain);
+  if (!validatedQname) {
+    // اگر خود دامنهٔ پایه برای NS/SOA استعلام شده باشد، پاسخ خالی NOERROR (NODATA) بدون ثبت شاهد برگردانده می‌شود
+    if (parsed.qname === normDomain && (parsed.qtype === 2 || parsed.qtype === 6)) {
+      return {
+        ignore: false,
+        rcode: 0,
+        responseBuffer: buildMinimalDnsResponse(msg, parsed.questionEndOffset, parsed.qtype, 0, true),
+        observation: null,
+      };
+    }
+    // سایر زیردامنه‌های نامعتبر در داخل دامنهٔ تست -> NXDOMAIN (RCODE=3, AA=1)
+    return {
+      ignore: false,
+      rcode: 3, // NXDOMAIN
+      responseBuffer: buildMinimalDnsResponse(msg, parsed.questionEndOffset, parsed.qtype, 3, true),
+      observation: null,
+    };
+  }
+
+  // ۷. پرس‌وجوی معتبر برای `p<N>.<runId>.<allowedDomain>` -> NOERROR (RCODE=0, AA=1) و ثبت شاهد
+  return {
+    ignore: false,
+    rcode: 0, // NOERROR
+    responseBuffer: buildMinimalDnsResponse(msg, parsed.questionEndOffset, parsed.qtype, 0, true),
+    observation: validatedQname,
+  };
+}
+
+/**
+ * تجزیه و اعتبارسنجی دقیق QNAME در قالب استاندارد `p<probeNumber>.<runId>.<allowedDomain>`
+ * - الزام تعلق به دامنهٔ مجاز تست (`allowedDomain`)
+ * - الزام وجود دقیقاً ۲ برچسب پیشوند (`p<N>` و `<runId>`)
+ * - تفکیک دقیق شمارهٔ پروب (`1..99`) و شناسهٔ اجرا (`runId`) بدون هیچ پیشوند یا پسوند اضافی
+ */
+export function parseDnsLeakQname(rawQname, allowedDomain = DNS_LEAK_DOMAIN) {
+  if (typeof rawQname !== 'string' || typeof allowedDomain !== 'string') return null;
+  const normDomain = allowedDomain.trim().toLowerCase().replace(/^\.+|\.+$/g, '');
+  if (normDomain.length < 3 || normDomain.length > 185 || normDomain.includes('..')) return null;
+  const domainLabels = normDomain.split('.');
+  if (
+    domainLabels.length < 2 ||
+    !domainLabels.every(l => l.length >= 1 && l.length <= 63 && DNS_SINGLE_LABEL_REGEX.test(l)) ||
+    domainLabels[domainLabels.length - 1].length < 2 ||
+    /^\d+$/.test(domainLabels[domainLabels.length - 1])
+  ) {
+    return null;
+  }
+
+  const trimmedQname = rawQname.trim().toLowerCase();
+  const qname = trimmedQname.endsWith('.') ? trimmedQname.slice(0, -1) : trimmedQname;
+  if (!qname || qname.length > 253 || qname.startsWith('.') || qname.includes('..')) return null;
+
+  const suffix = `.${normDomain}`;
   if (!qname.endsWith(suffix)) return null;
+
   const prefix = qname.slice(0, qname.length - suffix.length);
-  const parts = prefix.split('.').filter(Boolean);
-  // انتظار می‌رود آخرین بخشِ پیشوند، runId باشد: <probeLabel>.<runId>
-  if (parts.length < 1) return null;
-  const candidateRunId = parts[parts.length - 1];
-  return VALID_RUN_ID_REGEX.test(candidateRunId) ? candidateRunId : null;
+  if (!prefix) return null;
+
+  const prefixParts = prefix.split('.');
+  // قالب مجاز دقیقاً ۲ برچسب پیشوند دارد: <probeLabel>.<runId>
+  if (prefixParts.length !== 2) return null;
+
+  const [probeLabel, candidateRunId] = prefixParts;
+  const probeMatch = probeLabel.match(DNS_PROBE_LABEL_REGEX);
+  if (!probeMatch) return null;
+
+  if (
+    candidateRunId.length < 8 ||
+    candidateRunId.length > 63 ||
+    !VALID_RUN_ID_REGEX.test(candidateRunId) ||
+    PREFIXED_UUID_TRAP_REGEX.test(candidateRunId)
+  ) {
+    return null;
+  }
+
+  return {
+    qname,
+    probeLabel,
+    probeNumber: Number(probeMatch[1]),
+    runId: candidateRunId,
+    baseDomain: normDomain,
+  };
+}
+
+/**
+ * استخراج شناسهٔ دقیق runId (بدون پیشوند و پسوند) از زیردامنهٔ `p<N>.<runId>.<DNS_LEAK_DOMAIN>`
+ */
+export function extractRunIdFromQname(qname, allowedDomain = DNS_LEAK_DOMAIN) {
+  const parsed = parseDnsLeakQname(qname, allowedDomain);
+  return parsed ? parsed.runId : null;
 }
 
 /**
@@ -171,31 +338,46 @@ function forwardObservationToWorker(payload) {
   }
 }
 
-const server = dgram.createSocket('udp4');
+const isMainModule =
+  typeof process !== 'undefined' &&
+  Array.isArray(process.argv) &&
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 
-server.on('message', (msg, rinfo) => {
-  const parsed = parseDnsQname(msg);
-  if (!parsed) return;
-
-  const runId = extractRunIdFromQname(parsed.qname);
-  const respBuf = buildMinimalDnsResponse(msg, parsed.questionEndOffset, parsed.qtype);
-  server.send(respBuf, rinfo.port, rinfo.address);
-
-  if (runId && rinfo?.address) {
-    forwardObservationToWorker({
-      runId,
-      resolverIp: rinfo.address,
-      qname: parsed.qname,
-      observedAt: new Date().toISOString(),
-    });
+if (isMainModule) {
+  if (!DNS_LEAK_DOMAIN || !WORKER_INGEST_URL || !DNS_COLLECTOR_API_TOKEN) {
+    console.error(
+      '[Authoritative-UDP53] خطا: متغیرهای محیطی DNS_LEAK_DOMAIN، WORKER_INGEST_URL و DNS_COLLECTOR_API_TOKEN باید تنظیم شوند.'
+    );
+    process.exit(1);
   }
-});
 
-server.on('listening', () => {
-  const addr = server.address();
-  console.log(
-    `[Authoritative-UDP53] شنوندهٔ Authoritative DNS برای دامنهٔ ${DNS_LEAK_DOMAIN} روی ${addr.address}:${addr.port} فعال شد.`
-  );
-});
+  const server = dgram.createSocket('udp4');
 
-server.bind(UDP_PORT, BIND_ADDRESS);
+  server.on('message', (msg, rinfo) => {
+    const decision = evaluateDnsQueryPacket(msg, DNS_LEAK_DOMAIN);
+    if (decision.ignore || !decision.responseBuffer) return;
+
+    server.send(decision.responseBuffer, rinfo.port, rinfo.address);
+
+    if (decision.observation && rinfo?.address) {
+      forwardObservationToWorker({
+        runId: decision.observation.runId,
+        resolverIp: rinfo.address,
+        qname: decision.observation.qname,
+        probeNumber: decision.observation.probeNumber,
+        observedAt: new Date().toISOString(),
+      });
+    }
+  });
+
+  server.on('listening', () => {
+    const addr = server.address();
+    console.log(
+      `[Authoritative-UDP53] شنوندهٔ Authoritative DNS برای دامنهٔ ${DNS_LEAK_DOMAIN} روی ${addr.address}:${addr.port} فعال شد.`
+    );
+  });
+
+  server.bind(UDP_PORT, BIND_ADDRESS);
+}
+

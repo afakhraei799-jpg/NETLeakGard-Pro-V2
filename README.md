@@ -14,7 +14,7 @@
    - اعتبارسنجی سخت‌گیرانهٔ هدرهای پروکسی (`X-Forwarded-For` / `CF-Connecting-IP`) فقط در صورت فعال بودن `TRUST_PROXY=true` و اتصال از سوکت پروکسی داخلی، با انتخاب **راست‌ترین آدرس IP عمومی معتبر** جهت جلوگیری از جعل هدر (XFF Spoofing).
 
 2. **تفکیک کامل تست Authoritative DNS و مشاهدهٔ کمکی مرورگر (`performDnsLeakTest`):**
-   - **تست Authoritative DNS اختصاصی:** با تولید شناسهٔ یکتای رمزنگاری‌شده (`runId`) در هر اجرا و ارسال کوئری‌های ساب‌دامین غیرقابل‌حدس (`p1-${runId}.<DNS_LEAK_DOMAIN>`). در صورت تنظیم نبودن متغیرهای سرور، وضعیت صریحاً `NOT_CONFIGURED` («پیکربندی نشده») اعلام می‌شود.
+   - **تست Authoritative DNS اختصاصی:** با تولید شناسهٔ یکتای رمزنگاری‌شده (`runId`) در هر اجرا و ارسال کوئری‌های ساب‌دامین غیرقابل‌حدس با قالب استاندارد `p<N>.<runId>.<DNS_LEAK_DOMAIN>` (مانند `p1.<runId>.<DNS_LEAK_DOMAIN>`). در صورت تنظیم نبودن متغیرهای سرور یا تأیید نشدن شنوندهٔ UDP/53، وضعیت صریحاً `NOT_CONFIGURED` («پیکربندی نشده») اعلام می‌شود.
    - **مشاهدهٔ کمکی مرورگر (بدون هزینه):** استعلام مستقیم از سرویس‌های عمومی EDNS و Cloudflare Trace (`1.1.1.1/cdn-cgi/trace`). مشاهدهٔ یک Resolver یا تطابق کشور در مرورگر هرگز به‌عنوان اثبات عدم نشت DNS (`PASS`) یا نشت قطعی (`LEAK_DETECTED`) تلقی نمی‌شود.
 
 3. **تست واقعی نامزدهای WebRTC ICE (`performWebRtcLeakTest`):**
@@ -79,6 +79,8 @@ npm start
 | `DNS_LEAK_DOMAIN` | برای تست Authoritative DNS | دامنهٔ اختصاصی که رکورد `NS` آن به سرور Authoritative DNS شما اشاره می‌کند (مثال: `dnsleak.example.com`) |
 | `DNS_COLLECTOR_API_URL` | برای تست Authoritative DNS | آدرس HTTPS سرویس ثبت‌کنندهٔ لاگ‌های Authoritative DNS |
 | `DNS_COLLECTOR_API_TOKEN` | برای تست Authoritative DNS | توکن احراز هویت Bearer برای دریافت لاگ‌های Resolver از سرویس Collector |
+| `DNS_COLLECTOR_API_TOKEN_PREVIOUS` | خیر (اختیاری) | توکن قبلی جهت چرخش بدون قطعی توکن (Token Rotation) |
+| `DNS_UDP53_VERIFIED` | در Cloudflare Worker | تا پیش از راه‌اندازی و تأیید عملی شنوندهٔ UDP/53 باید `"false"` بماند |
 | `ABUSEIPDB_API_KEY` | خیر (اختیاری) | کلید رسمی AbuseIPDB جهت استعلام واقعی سابقهٔ آدرس IP |
 | `GEMINI_API_KEY` | خیر (اختیاری) | کلید سرویس Gemini جهت تولید گزارش تحلیلی فارسی (در صورت نبود یا خطا، گزارش مبتنی بر قواعد قطعی تولید می‌شود) |
 
@@ -88,9 +90,9 @@ npm start
 
 - یک **Cloudflare Worker معمولی مبتنی بر HTTP** به‌تنهایی نمی‌تواند بسته‌های خام `UDP/53` مربوط به Resolverهای DNS سیستم‌عامل کاربر را دریافت کند.
 - برای فعال‌سازی تست کامل **Authoritative DNS Leak**:
-  1. یک زیرشاخهٔ دامنه (مثلاً `dnsleak.example.com`) تعریف کنید و رکورد `NS` آن را به یک سرور سبک Authoritative DNS (مانند CoreDNS یا اسکریپت UDP/53 اختصاصی) متصل نمایید.
-  2. سرور Authoritative باید آدرس IP مبدا (Recursive Resolver) هر کوئری با الگوی `p*-<runId>.dnsleak.example.com` را به همراه ASN/ISP استخراج کرده و از طریق API امن (`DNS_COLLECTOR_API_URL`) یا فضای KV کلادفلر (`cloudflare/worker.ts`) در اختیار برنامه قرار دهد.
-  3. متغیرهای `DNS_LEAK_DOMAIN`، `DNS_COLLECTOR_API_URL` و `DNS_COLLECTOR_API_TOKEN` را در فایل `.env` تنظیم کنید.
+  1. یک زیرشاخهٔ دامنه (مثلاً `dnsleak.example.com`) تعریف کنید و رکورد `NS` آن را به یک شنوندهٔ عمومی Authoritative DNS روی پورت `UDP/53` (اسکریپت `cloudflare/authoritative-dns-udp53.mjs`) متصل نمایید.
+  2. شنوندهٔ Authoritative آدرس IP مبدا (Recursive Resolver) هر کوئری با الگوی استاندارد `p<N>.<runId>.<DNS_LEAK_DOMAIN>` را استخراج کرده و از طریق مسیر امن `POST /api/dns-collector/ingest` در `cloudflare/worker.ts` (با هدر `Authorization: Bearer <DNS_COLLECTOR_API_TOKEN>`) ثبت می‌کند.
+  3. متغیرهای `DNS_LEAK_DOMAIN`، `DNS_COLLECTOR_API_URL`، `DNS_COLLECTOR_API_TOKEN` و پس از تأیید عملی، `DNS_UDP53_VERIFIED="true"` را تنظیم کنید.
 
 ---
 

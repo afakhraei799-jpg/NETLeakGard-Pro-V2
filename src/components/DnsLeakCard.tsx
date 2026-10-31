@@ -109,7 +109,7 @@ export const DnsLeakCard: React.FC<DnsLeakCardProps> = ({ dnsLeak, lang }) => {
         {dnsLeak && dnsLeak.resolvers.length > 0 && (
           <div className="space-y-2">
             <div className="flex items-center justify-between text-xs text-slate-400 px-1 font-semibold">
-              <span>{isFa ? 'Resolverهای ثبت‌شده در سرور Authoritative:' : 'Authoritative Resolvers:'}</span>
+              <span>{isFa ? 'IPهای Resolver مشاهده‌شده (پس از حذف تکراری):' : 'Observed Resolver IPs (Deduplicated):'}</span>
               <span>{dnsLeak.detectedResolversCount}</span>
             </div>
             <div className="space-y-2 max-h-36 overflow-y-auto pr-1">

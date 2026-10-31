@@ -942,15 +942,304 @@ export function evaluateIndependentBrowserDnsObservation(
   };
 }
 
+export interface ParsedDnsLeakQname {
+  valid: boolean;
+  qname: string;
+  probeLabel: string | null;
+  probeNumber: number | null;
+  runId: string | null;
+  baseDomain: string | null;
+  errorCode:
+    | null
+    | 'EMPTY_OR_OVERSIZED_QNAME'
+    | 'INVALID_DNS_LABEL'
+    | 'QNAME_DOMAIN_MISMATCH'
+    | 'INVALID_QNAME_STRUCTURE'
+    | 'INVALID_PROBE_LABEL'
+    | 'INVALID_RUN_ID_LABEL';
+}
+
+const DNS_SINGLE_LABEL_REGEX = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
+const DNS_PROBE_LABEL_REGEX = /^p([1-9][0-9]?)$/i;
+const DNS_RUN_ID_LABEL_REGEX = /^[a-z0-9](?:[a-z0-9-]{6,61}[a-z0-9])$/i;
+const PREFIXED_UUID_TRAP_REGEX = /^p[0-9]+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Validates that a runId is a single RFC 1035 compliant DNS label (8 to 63 ASCII alphanumeric/hyphen chars,
+ * not starting or ending with a hyphen, containing no dots, and not contaminated by a `p<N>-` probe prefix).
+ */
+export function isValidDnsRunId(runId: unknown): boolean {
+  if (typeof runId !== 'string') return false;
+  if (runId.trim() !== runId || runId.length < 8 || runId.length > 63) return false;
+  if (!DNS_RUN_ID_LABEL_REGEX.test(runId)) return false;
+  if (PREFIXED_UUID_TRAP_REGEX.test(runId)) return false;
+  return true;
+}
+
+/**
+ * Validates that a base domain for DNS leak testing is a well-formed multi-label DNS domain
+ * within RFC 1035 length limits (allowing room for `p<N>.<runId>.` prefix labels).
+ */
+export function isValidDnsLeakBaseDomain(domain: unknown): boolean {
+  if (typeof domain !== 'string') return false;
+  const norm = domain.trim().toLowerCase().replace(/^\.+|\.+$/g, '');
+  if (norm.length < 3 || norm.length > 185 || norm.includes('..')) return false;
+  const labels = norm.split('.');
+  if (labels.length < 2) return false;
+  for (const label of labels) {
+    if (label.length < 1 || label.length > 63 || !DNS_SINGLE_LABEL_REGEX.test(label)) {
+      return false;
+    }
+  }
+  const tld = labels[labels.length - 1];
+  if (tld.length < 2 || /^\d+$/.test(tld)) return false;
+  return true;
+}
+
+/**
+ * Builds the canonical, unambiguous DNS leak probe QNAME: `p<probeNumber>.<runId>.<baseDomain>`
+ * Returns null if any component violates RFC 1035 label or domain rules.
+ */
+export function buildDnsLeakProbeQname(
+  probeNumber: number,
+  runId: string,
+  baseDomain: string
+): string | null {
+  if (!Number.isInteger(probeNumber) || probeNumber < 1 || probeNumber > 99) {
+    return null;
+  }
+  if (!isValidDnsRunId(runId) || !isValidDnsLeakBaseDomain(baseDomain)) {
+    return null;
+  }
+  const normRunId = runId.trim().toLowerCase();
+  const normDomain = baseDomain.trim().toLowerCase().replace(/^\.+|\.+$/g, '');
+  const qname = `p${probeNumber}.${normRunId}.${normDomain}`;
+  if (qname.length > 253) return null;
+  return qname;
+}
+
+/**
+ * Strictly parses and validates a DNS leak probe QNAME against the canonical `<probeLabel>.<runId>.<baseDomain>` format.
+ * - Enforces RFC 1035 label length (1..63) and total QNAME length (<= 253).
+ * - When `allowedBaseDomain` is provided, requires `qname` to belong to `.${allowedBaseDomain}` with EXACTLY two prefix labels (`p<N>` and `<runId>`).
+ * - Cleanly separates `probeNumber` (`1..99`) and `runId` (exact UUID/token without prefix or suffix).
+ * - Rejects malformed formats such as `p1-<runId>.<domain>`, `<runId>.<domain>`, or `extra.p1.<runId>.<domain>`.
+ */
+export function parseDnsLeakProbeQname(
+  rawQname: unknown,
+  allowedBaseDomain?: string | null
+): ParsedDnsLeakQname {
+  if (typeof rawQname !== 'string') {
+    return {
+      valid: false,
+      qname: '',
+      probeLabel: null,
+      probeNumber: null,
+      runId: null,
+      baseDomain: null,
+      errorCode: 'EMPTY_OR_OVERSIZED_QNAME',
+    };
+  }
+
+  const trimmed = rawQname.trim().toLowerCase();
+  const qname = trimmed.endsWith('.') ? trimmed.slice(0, -1) : trimmed;
+  if (!qname || qname.length > 253 || qname.startsWith('.') || qname.endsWith('.') || qname.includes('..')) {
+    return {
+      valid: false,
+      qname,
+      probeLabel: null,
+      probeNumber: null,
+      runId: null,
+      baseDomain: null,
+      errorCode: 'EMPTY_OR_OVERSIZED_QNAME',
+    };
+  }
+
+  const labels = qname.split('.');
+  for (const label of labels) {
+    if (label.length < 1 || label.length > 63 || !DNS_SINGLE_LABEL_REGEX.test(label)) {
+      return {
+        valid: false,
+        qname,
+        probeLabel: null,
+        probeNumber: null,
+        runId: null,
+        baseDomain: null,
+        errorCode: 'INVALID_DNS_LABEL',
+      };
+    }
+  }
+
+  let probeLabel: string;
+  let candidateRunId: string;
+  let baseDomain: string;
+
+  if (allowedBaseDomain !== undefined && allowedBaseDomain !== null && String(allowedBaseDomain).trim() !== '') {
+    const normAllowed = String(allowedBaseDomain).trim().toLowerCase().replace(/^\.+|\.+$/g, '');
+    if (!isValidDnsLeakBaseDomain(normAllowed) || !qname.endsWith(`.${normAllowed}`)) {
+      return {
+        valid: false,
+        qname,
+        probeLabel: null,
+        probeNumber: null,
+        runId: null,
+        baseDomain: null,
+        errorCode: 'QNAME_DOMAIN_MISMATCH',
+      };
+    }
+    const prefix = qname.slice(0, qname.length - (normAllowed.length + 1));
+    const prefixLabels = prefix ? prefix.split('.') : [];
+    if (prefixLabels.length !== 2) {
+      return {
+        valid: false,
+        qname,
+        probeLabel: null,
+        probeNumber: null,
+        runId: null,
+        baseDomain: normAllowed,
+        errorCode: 'INVALID_QNAME_STRUCTURE',
+      };
+    }
+    probeLabel = prefixLabels[0];
+    candidateRunId = prefixLabels[1];
+    baseDomain = normAllowed;
+  } else {
+    if (labels.length < 4) {
+      return {
+        valid: false,
+        qname,
+        probeLabel: null,
+        probeNumber: null,
+        runId: null,
+        baseDomain: null,
+        errorCode: 'INVALID_QNAME_STRUCTURE',
+      };
+    }
+    probeLabel = labels[0];
+    candidateRunId = labels[1];
+    baseDomain = labels.slice(2).join('.');
+    if (!isValidDnsLeakBaseDomain(baseDomain)) {
+      return {
+        valid: false,
+        qname,
+        probeLabel: null,
+        probeNumber: null,
+        runId: null,
+        baseDomain: null,
+        errorCode: 'QNAME_DOMAIN_MISMATCH',
+      };
+    }
+  }
+
+  const probeMatch = probeLabel.match(DNS_PROBE_LABEL_REGEX);
+  if (!probeMatch) {
+    return {
+      valid: false,
+      qname,
+      probeLabel,
+      probeNumber: null,
+      runId: null,
+      baseDomain,
+      errorCode: 'INVALID_PROBE_LABEL',
+    };
+  }
+
+  if (!isValidDnsRunId(candidateRunId)) {
+    return {
+      valid: false,
+      qname,
+      probeLabel,
+      probeNumber: Number(probeMatch[1]),
+      runId: null,
+      baseDomain,
+      errorCode: 'INVALID_RUN_ID_LABEL',
+    };
+  }
+
+  return {
+    valid: true,
+    qname,
+    probeLabel,
+    probeNumber: Number(probeMatch[1]),
+    runId: candidateRunId,
+    baseDomain,
+    errorCode: null,
+  };
+}
+
+/**
+ * Strictly verifies whether an object is an authentic, structured Authoritative DNS observation record.
+ * Rejects records that:
+ * 1. Lack a valid runId string or have runId mismatching expectedRunId.
+ * 2. Lack an observedAt timestamp, have an unparseable timestamp, or are stale (> 5 min) / future skew (> 60s).
+ * 3. Have a missing, non-canonical, or non-globally-routable public IP (RFC1918, loopback, CGNAT, link-local, multicast, documentation, etc.).
+ * 4. Lack a valid canonical queryName/qname (`p<N>.<runId>.<domain>`) or have a qname whose extracted runId or domain does not match the active run.
+ * 5. Have an observationMethod other than 'authoritative_dns_log'.
+ */
+export function isValidDnsObservationRecord(
+  record: unknown,
+  expectedRunId: string,
+  nowMs = Date.now(),
+  expectedDomain?: string | null
+): boolean {
+  if (!record || typeof record !== 'object') return false;
+  const r = record as Record<string, unknown>;
+
+  const normExpectedRunId = typeof expectedRunId === 'string' ? expectedRunId.trim() : '';
+  if (!isValidDnsRunId(normExpectedRunId)) return false;
+
+  // 1. Mandatory runId and strict exact match
+  const recRunId = typeof r.runId === 'string' ? r.runId.trim() : '';
+  if (!recRunId || recRunId.toLowerCase() !== normExpectedRunId.toLowerCase()) return false;
+
+  // 2. Mandatory observedAt timestamp within freshness window (5 min past, 60s future)
+  if (typeof r.observedAt !== 'string' || !r.observedAt.trim()) {
+    return false;
+  }
+  const ts = Date.parse(r.observedAt);
+  if (!Number.isFinite(ts)) return false;
+  const ageMs = nowMs - ts;
+  if (ageMs > 5 * 60 * 1000 || ageMs < -60 * 1000) {
+    return false;
+  }
+
+  // 3. Strict globally routable public IP
+  const rawIp = typeof r.primaryIp === 'string' ? r.primaryIp : typeof r.ip === 'string' ? r.ip : '';
+  const canonicalIp = canonicalizeIp(rawIp);
+  if (!canonicalIp || !isGloballyRoutablePublicIp(canonicalIp)) {
+    return false;
+  }
+
+  // 4. Mandatory canonical QNAME (`p<N>.<runId>.<domain>`) bound to this exact runId (and domain if provided)
+  const rawQname =
+    typeof r.queryName === 'string'
+      ? r.queryName
+      : typeof r.qname === 'string'
+        ? r.qname
+        : '';
+  const parsedQname = parseDnsLeakProbeQname(rawQname, expectedDomain);
+  if (!parsedQname.valid || parsedQname.runId !== normExpectedRunId.toLowerCase()) {
+    return false;
+  }
+
+  // 5. Must have authoritative_dns_log provenance if observationMethod is specified
+  if (r.observationMethod && r.observationMethod !== 'authoritative_dns_log') {
+    return false;
+  }
+
+  return true;
+}
+
 /**
  * Evaluates DNS Leak results based on real authoritative logs or explicitly marks NOT_CONFIGURED / INCONCLUSIVE.
  * Never inspects localized status text (like "Leak" or "مغایرت") to decide leak state.
- * Validates runId, resolver runId affiliation, observationMethod, valid resolver IPs, and structured comparison criteria against ipDetails.
+ * Validates runId, resolver runId + QNAME affiliation, observationMethod, valid resolver IPs, and structured comparison criteria against ipDetails.
  */
 export function evaluateDnsTestResult(params: {
   runId: string;
   authoritativeConfigured: boolean;
   missingEnvVars?: string[];
+  dnsLeakDomain?: string | null;
   resolvers: DnsResolver[];
   ipDetails: IpDetails | null;
   independentBrowserObservation?: IndependentBrowserDnsObservation;
@@ -962,6 +1251,7 @@ export function evaluateDnsTestResult(params: {
     runId,
     authoritativeConfigured,
     missingEnvVars = ['DNS_LEAK_DOMAIN', 'DNS_COLLECTOR_API_URL', 'DNS_COLLECTOR_API_TOKEN'],
+    dnsLeakDomain,
     resolvers,
     ipDetails,
     independentBrowserObservation,
@@ -972,7 +1262,8 @@ export function evaluateDnsTestResult(params: {
 
   const dnsLimitations = [
     'مشاهدهٔ آدرس IP در سرور Authoritative DNS فقط آخرین گره (Egress Resolver) زنجیرهٔ DNS را نشان می‌دهد و در صورت استفاده از DoH/DoT یا فورواردر واسط، کل زنجیره آشکار نمی‌شود.',
-    'تست DNS از داخل مرورگر صرفاً درخواست‌های شبکهٔ مرورگر (یا DoH فعال در مرورگر) را آزمایش می‌کند و وضعیت Resolver سطح سیستم‌عامل (OS-level DNS) سایر برنامه‌ها را اثبات نمی‌کند.',
+    'تعداد گزارش‌شده بیانگر «IPهای Resolver مشاهده‌شده» (Observed Resolver IPs) پس از حذف تکراری‌ها است؛ به دلیل توزیع بار (Load Balancing) و Anycast، چند IP مختلف ممکن است متعلق به یک سرویس‌دهندهٔ واحد باشند.',
+    'تست DNS از داخل مرورگر صرفاً درخواست‌های شبکهٔ مرورگر (یا DoH اختصاصی فعال در مرورگر) را آزمایش می‌کند و وضعیت Resolver سطح سیستم‌عامل (OS-level DNS) سایر برنامه‌ها را اثبات نمی‌کند.',
     'بررسی DNS از طریق مرورگر با تست Authoritative DNS Leak یکسان نیست؛ برای اثبات قطعی عدم نشت، سرور Authoritative DNS اختصاصی الزامی است.'
   ];
 
@@ -1001,7 +1292,7 @@ export function evaluateDnsTestResult(params: {
       },
       limitations: [
         ...dnsLimitations,
-        `برای فعال‌سازی تست Authoritative DNS، تنظیم متغیرهای ${missingList.join('، ')} جهت ثبت کوئری ساب‌دامین یکتای هر اجرا (\${runId}.<DNS_LEAK_DOMAIN>) ضروری است.`
+        `برای فعال‌سازی تست Authoritative DNS، تنظیم متغیرهای ${missingList.join('، ')} جهت ثبت کوئری ساب‌دامین یکتای هر اجرا (p1.\${runId}.<DNS_LEAK_DOMAIN>) ضروری است.`
       ],
       errorCode: 'AUTHORITATIVE_DNS_NOT_CONFIGURED',
       source: 'Authoritative DNS Configuration Check',
@@ -1042,13 +1333,13 @@ export function evaluateDnsTestResult(params: {
     };
   }
 
-  if (!normalizedRunId || !/^[a-zA-Z0-9_-]{4,128}$/.test(normalizedRunId)) {
+  if (!isValidDnsRunId(normalizedRunId)) {
     return {
       status: 'INCONCLUSIVE',
       testName: 'Authoritative DNS Leak & Resolver Probe',
       startedAt,
       completedAt,
-      observations: ['شناسهٔ اجرای تست (runId) نامعتبر یا خالی است؛ امکان انتساب رویدادهای DNS به این اجرا وجود ندارد.'],
+      observations: ['شناسهٔ اجرای تست (runId) نامعتبر یا خارج از قالب برچسب DNS است؛ امکان انتساب رویدادهای DNS به این اجرا وجود ندارد.'],
       evidence: { runId: normalizedRunId, authoritativeConfigured: true },
       limitations: dnsLimitations,
       errorCode: 'INVALID_RUN_ID',
@@ -1093,29 +1384,33 @@ export function evaluateDnsTestResult(params: {
   }
 
   // Validate structural integrity of all resolver records:
-  // 1. runId match
-  // 2. queryName (if present) contains runId label
-  // 3. observedAt (if present) is valid and within 5-minute freshness window (anti-replay)
+  // 1. Mandatory runId on EVERY record, matching normalizedRunId exactly
+  // 2. Mandatory canonical queryName (`p<N>.<runId>.<domain>`) matching normalizedRunId (and dnsLeakDomain if provided)
+  // 3. Mandatory observedAt timestamp within 5-minute freshness window
   // 4. observationMethod === 'authoritative_dns_log' and globally routable public IP
-  const hasRunIdMismatch = resolvers.some(r => {
-    if (typeof r.runId === 'string' && r.runId.trim() !== '' && r.runId.trim() !== normalizedRunId) {
+  const hasRunIdOrQnameMismatch = resolvers.some(r => {
+    if (!r || typeof r.runId !== 'string' || r.runId.trim().toLowerCase() !== normalizedRunId.toLowerCase()) {
       return true;
     }
-    if (typeof r.queryName === 'string' && r.queryName.trim() !== '') {
-      const labels = r.queryName.trim().toLowerCase().replace(/\.$/, '').split('.');
-      if (!labels.includes(normalizedRunId.toLowerCase())) {
-        return true;
-      }
+    const rawQname =
+      typeof r.queryName === 'string'
+        ? r.queryName
+        : typeof (r as any).qname === 'string'
+          ? (r as any).qname
+          : '';
+    const parsedQname = parseDnsLeakProbeQname(rawQname, dnsLeakDomain);
+    if (!parsedQname.valid || parsedQname.runId !== normalizedRunId.toLowerCase()) {
+      return true;
     }
     return false;
   });
-  if (hasRunIdMismatch) {
+  if (hasRunIdOrQnameMismatch) {
     return {
       status: 'INCONCLUSIVE',
       testName: 'Authoritative DNS Leak & Resolver Probe',
       startedAt,
       completedAt,
-      observations: ['برخی از رکوردهای Resolver دریافت‌شده متعلق به runId یا نام پرس‌وجوی دیگری هستند و قابل استناد نیستند.'],
+      observations: ['برخی از رکوردهای Resolver دریافت‌شده فاقد runId یا queryName معتبر در قالب p<N>.<runId>.<domain> هستند یا با شناسهٔ اجرای فعلی تطابق ندارند.'],
       evidence: { runId: normalizedRunId, resolvers },
       limitations: dnsLimitations,
       errorCode: 'RUN_ID_MISMATCH',
@@ -1128,17 +1423,17 @@ export function evaluateDnsTestResult(params: {
       resolvers: [],
       isLeaking: null,
       independentBrowserObservation,
-      messageFa: 'نامشخص: عدم تطابق شناسهٔ اجرا (runId) یا نام پرس‌وجو در رویدادهای دریافت‌شده از سرور DNS.',
-      messageEn: 'Inconclusive: Resolver event runId or queryName does not match the active test runId.',
+      messageFa: 'نامشخص: عدم وجود یا عدم تطابق شناسهٔ اجرا (runId) یا قالب نام پرس‌وجو (QNAME) در رویدادهای دریافت‌شده از سرور DNS.',
+      messageEn: 'Inconclusive: Resolver event runId or canonical queryName is missing or does not match the active test runId.',
     };
   }
 
   const nowMs = Date.now();
-  const MAX_DNS_OBSERVATION_AGE_MS = 5 * 60 * 1000; // 5 minutes anti-replay window
+  const MAX_DNS_OBSERVATION_AGE_MS = 5 * 60 * 1000; // 5 minutes session freshness window
   const MAX_FUTURE_SKEW_MS = 60 * 1000; // 1 minute clock skew tolerance
 
   const hasStaleOrInvalidTimestamp = resolvers.some(r => {
-    if (typeof r.observedAt !== 'string' || r.observedAt.trim() === '') return false;
+    if (!r || typeof r.observedAt !== 'string' || r.observedAt.trim() === '') return true;
     const parsedMs = Date.parse(r.observedAt);
     if (!Number.isFinite(parsedMs)) return true;
     const ageMs = nowMs - parsedMs;
@@ -1151,7 +1446,7 @@ export function evaluateDnsTestResult(params: {
       testName: 'Authoritative DNS Leak & Resolver Probe',
       startedAt,
       completedAt,
-      observations: ['برخی از رکوردهای Resolver دارای زمان مشاهدهٔ منقضی‌شده یا نامعتبر هستند (محافظت در برابر Replay).'],
+      observations: ['برخی از رکوردهای Resolver فاقد زمان مشاهده (observedAt)، دارای زمان نامعتبر یا خارج از بازهٔ ۵ دقیقه‌ای نشست هستند.'],
       evidence: { runId: normalizedRunId, resolvers },
       limitations: dnsLimitations,
       errorCode: 'STALE_DNS_OBSERVATION',
@@ -1164,8 +1459,8 @@ export function evaluateDnsTestResult(params: {
       resolvers: [],
       isLeaking: null,
       independentBrowserObservation,
-      messageFa: 'نامشخص: رکوردهای DNS دریافت‌شده قدیمی یا خارج از بازهٔ زمانی مجاز این نشست هستند.',
-      messageEn: 'Inconclusive: Observed DNS records are stale or outside the valid session time window.',
+      messageFa: 'نامشخص: رکوردهای DNS فاقد زمان ثبت معتبر، قدیمی یا خارج از بازهٔ زمانی مجاز این نشست هستند.',
+      messageEn: 'Inconclusive: Observed DNS records are missing timestamps, stale, or outside the valid session time window.',
     };
   }
 
@@ -1318,7 +1613,7 @@ export function evaluateDnsTestResult(params: {
       startedAt,
       completedAt,
       observations: [
-        `تعداد ${resolvers.length} سرور Resolver در Authoritative DNS برای شناسهٔ ${normalizedRunId} ثبت شد که بر پایهٔ شواهد ساختاری (عدم تطابق ASN، ISP، کشور و عدم رمزنگاری DoH) با مسیر خروجی مغایرت دارند.`
+        `تعداد ${resolvers.length} IP Resolver مشاهده‌شده در Authoritative DNS برای شناسهٔ ${normalizedRunId} ثبت شد که بر پایهٔ شواهد ساختاری (عدم تطابق ASN، ISP، کشور و عدم رمزنگاری DoH) با مسیر خروجی مغایرت دارند.`
       ],
       evidence: {
         runId: normalizedRunId,
@@ -1339,8 +1634,8 @@ export function evaluateDnsTestResult(params: {
       resolvers,
       isLeaking: true,
       independentBrowserObservation,
-      messageFa: 'نشت شناسایی شد: بر اساس مقایسهٔ ساختاری ASN، ISP و مشخصات سرورهای Resolver ثبت‌شده در Authoritative DNS، درخواست‌های DNS خارج از مسیر تونل ارسال شده‌اند.',
-      messageEn: 'Leak Detected: Structural comparison of ASN, ISP, and resolver attributes in authoritative DNS logs confirms DNS traffic outside the expected egress network.',
+      messageFa: 'نشت شناسایی شد: بر اساس مقایسهٔ ساختاری ASN، ISP و مشخصات IPهای Resolver مشاهده‌شده در Authoritative DNS، درخواست‌های DNS خارج از مسیر تونل ارسال شده‌اند.',
+      messageEn: 'Leak Detected: Structural comparison of ASN, ISP, and observed resolver IPs in authoritative DNS logs confirms DNS traffic outside the expected egress network.',
     };
   }
 
@@ -1351,7 +1646,7 @@ export function evaluateDnsTestResult(params: {
       startedAt,
       completedAt,
       observations: [
-        `تعداد ${resolvers.length} سرور Resolver برای شناسهٔ ${normalizedRunId} مشاهده شد، اما شواهد ساختاری کافی برای اثبات تطابق کامل یا نشت قطعی (مانند صرفاً تفاوت کشور یا نبود متادیتای کامل ASN/ISP) وجود ندارد.`
+        `تعداد ${resolvers.length} IP Resolver مشاهده‌شده برای شناسهٔ ${normalizedRunId} ثبت شد، اما شواهد ساختاری کافی برای اثبات تطابق کامل یا نشت قطعی (مانند صرفاً تفاوت کشور یا نبود متادیتای کامل ASN/ISP) وجود ندارد.`
       ],
       evidence: {
         runId: normalizedRunId,
@@ -1372,8 +1667,8 @@ export function evaluateDnsTestResult(params: {
       resolvers,
       isLeaking: null,
       independentBrowserObservation,
-      messageFa: 'نامشخص: Resolver در سرور Authoritative مشاهده شد، اما اطلاعات مقایسه‌ای کافی نیست یا صرفاً تفاوت جغرافیایی بدون شواهد قطعی نشت ISP وجود دارد.',
-      messageEn: 'Inconclusive: Authoritative resolver(s) observed, but comparison metadata is insufficient to prove either leak-free routing or a confirmed leak.',
+      messageFa: 'نامشخص: IPهای Resolver در سرور Authoritative مشاهده شدند، اما اطلاعات مقایسه‌ای کافی نیست یا صرفاً تفاوت جغرافیایی بدون شواهد قطعی نشت ISP وجود دارد.',
+      messageEn: 'Inconclusive: Authoritative resolver IP(s) observed, but comparison metadata is insufficient to prove either leak-free routing or a confirmed leak.',
     };
   }
 
@@ -1383,7 +1678,7 @@ export function evaluateDnsTestResult(params: {
     startedAt,
     completedAt,
     observations: [
-      `تعداد ${resolvers.length} سرور Resolver از طریق لاگ واقعی Authoritative DNS برای شناسهٔ ${normalizedRunId} با تطابق ساختاری تأیید شد.`
+      `تعداد ${resolvers.length} IP Resolver مشاهده‌شده از طریق لاگ واقعی Authoritative DNS برای شناسهٔ ${normalizedRunId} با تطابق ساختاری تأیید شد.`
     ],
     evidence: {
       runId: normalizedRunId,
@@ -1403,8 +1698,8 @@ export function evaluateDnsTestResult(params: {
     resolvers,
     isLeaking: false,
     independentBrowserObservation,
-    messageFa: `موفق: آزمایش Authoritative DNS با شواهد ساختاری معتبر تکمیل شد (${resolvers.length} سرور Resolver منطبق ثبت گردید).`,
-    messageEn: `Pass: Authoritative DNS probe completed with ${resolvers.length} structurally verified resolver(s).`,
+    messageFa: `موفق: آزمایش Authoritative DNS با شواهد ساختاری معتبر تکمیل شد (${resolvers.length} IP Resolver مشاهده‌شده منطبق ثبت گردید).`,
+    messageEn: `Pass: Authoritative DNS probe completed with ${resolvers.length} structurally verified observed resolver IP(s).`,
   };
 }
 

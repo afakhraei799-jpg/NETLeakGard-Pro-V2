@@ -17,13 +17,23 @@
  *    - That UDP/53 responder extracts the packet's source IP (the true Recursive DNS Resolver IP) and sends
  *      an authenticated `POST /api/dns-collector/ingest` request (with `Authorization: Bearer <DNS_COLLECTOR_API_TOKEN>`)
  *      to this Cloudflare Worker.
- *    - This Worker validates the token (supporting zero-downtime token rotation), `runId`, `qname`, timestamp
- *      freshness (anti-replay), and public IP, and stores the record in Cloudflare KV (`DNS_LOGS_KV`)
- *      under `dns:<runId>` with a 300-second TTL.
+ *    - This Worker validates the token (supporting zero-downtime token rotation), `runId`, canonical `qname`
+ *      (`p<N>.<runId>.<DNS_LEAK_DOMAIN>`), timestamp freshness window (`<= 5 min`), and public IP, and stores
+ *      the deduplicated record in Cloudflare KV (`DNS_LOGS_KV`) under `dns:<runId>` with a 300-second TTL.
  *    - When the frontend calls `GET /api/dns-leak-probe?runId=<runId>`, this Worker reads `dns:<runId>` from KV
- *      and returns ONLY verified, non-expired `authoritative_dns_log` entries strictly matching that `runId`.
+ *      and returns ONLY verified, non-expired `authoritative_dns_log` entries strictly matching that `runId` and `qname`.
  *
- * 3. Default Safe State («پیکربندی نشده» / NOT_CONFIGURED):
+ * 3. KV Retention, Polling vs Cross-Run Isolation, and Consistency Limitations:
+ *    - Cross-run reuse is strictly blocked because every record is bound to both its unique `runId` and `qname`
+ *      (`p<N>.<runId>.<DNS_LEAK_DOMAIN>`), and KV keys are isolated by `dns:<runId>`.
+ *    - To support the client's bounded sequential polling (up to 3 attempts, 400ms apart while `p1`..`p3` UDP packets arrive),
+ *      KV records are retained until their 300-second TTL expires rather than deleted on first read; therefore,
+ *      single-use (burn-after-reading) deletion for repeated reads of the *same* `runId` within the 5-minute TTL is NOT claimed.
+ *    - Cloudflare Workers KV is an eventually consistent store across global colos and does not provide atomic
+ *      read-modify-write (`get` + `put`) transactions; concurrent UDP/53 ingest calls for the same `runId` can
+ *      experience write races unless backed by Durable Objects.
+ *
+ * 4. Default Safe State («پیکربندی نشده» / NOT_CONFIGURED):
  *    - Until `DNS_LEAK_DOMAIN`, `DNS_LOGS_KV`, `DNS_COLLECTOR_API_TOKEN`, and `DNS_UDP53_VERIFIED="true"`
  *      are all configured and verified, `/api/dns-leak-probe` returns `authoritativeConfigured: false`
  *      so the application strictly displays «پیکربندی نشده» (`NOT_CONFIGURED`).
@@ -33,6 +43,9 @@ import {
   COMMON_SENSITIVE_PORTS,
   canonicalizeIp,
   isGloballyRoutablePublicIp,
+  isValidDnsObservationRecord,
+  isValidDnsRunId,
+  parseDnsLeakProbeQname,
   validateAiAuditPayload
 } from '../src/utils/networkEvaluator';
 
@@ -66,8 +79,7 @@ export interface Env {
   ASSETS?: AssetsFetcherLike;
 }
 
-const VALID_RUN_ID_REGEX = /^[a-zA-Z0-9-]{8,64}$/;
-const MAX_OBSERVATION_AGE_MS = 5 * 60 * 1000; // 5 minutes anti-replay window
+const MAX_OBSERVATION_AGE_MS = 5 * 60 * 1000; // 5 minutes session freshness window
 const MAX_FUTURE_SKEW_MS = 60 * 1000; // 1 minute clock skew tolerance
 const MAX_JSON_BODY_BYTES = 32 * 1024; // 32 KB max request body size
 
@@ -170,6 +182,48 @@ async function readBoundedJsonBody(
   }
 
   try {
+    // If request has a readable stream body, read in chunks up to maxBytes to prevent memory exhaustion
+    if (request.body && typeof (request.body as any).getReader === 'function') {
+      const reader = (request.body as ReadableStream<Uint8Array>).getReader();
+      const chunks: Uint8Array[] = [];
+      let totalBytes = 0;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          totalBytes += value.byteLength;
+          if (totalBytes > maxBytes) {
+            await reader.cancel();
+            return {
+              ok: false,
+              status: 413,
+              errorCode: 'PAYLOAD_TOO_LARGE',
+              error: `حجم بدنهٔ درخواست بیش از حد مجاز (${maxBytes} بایت) است.`,
+            };
+          }
+          chunks.push(value);
+        }
+      }
+
+      if (chunks.length === 0) {
+        return { ok: true, data: {} };
+      }
+
+      const combined = new Uint8Array(totalBytes);
+      let offset = 0;
+      for (const chunk of chunks) {
+        combined.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      const rawText = new TextDecoder('utf-8').decode(combined);
+      if (!rawText.trim()) {
+        return { ok: true, data: {} };
+      }
+      return { ok: true, data: JSON.parse(rawText) };
+    }
+
+    // Fallback if request.body stream is not available
     const rawText = await request.text();
     if (new TextEncoder().encode(rawText).byteLength > maxBytes) {
       return {
@@ -229,8 +283,12 @@ function isFreshObservationTimestamp(isoTimestamp: unknown, nowMs = Date.now()):
   return ageMs <= MAX_OBSERVATION_AGE_MS && ageMs >= -MAX_FUTURE_SKEW_MS;
 }
 
-function sanitizeValidatedResolversForRun(rawRecords: unknown, expectedRunId: string) {
-  if (!Array.isArray(rawRecords)) return [];
+function sanitizeValidatedResolversForRun(
+  rawRecords: unknown,
+  expectedRunId: string,
+  expectedDomain?: string | null
+) {
+  if (!Array.isArray(rawRecords) || !isValidDnsRunId(expectedRunId)) return [];
   const nowMs = Date.now();
   const seenIps = new Set<string>();
   const validResolvers: Array<{
@@ -242,7 +300,7 @@ function sanitizeValidatedResolversForRun(rawRecords: unknown, expectedRunId: st
     location: string;
     countryCode?: string;
     runId: string;
-    queryName?: string;
+    queryName: string;
     observedAt: string;
     status: string;
     responseTimeMs: number | null;
@@ -254,36 +312,25 @@ function sanitizeValidatedResolversForRun(rawRecords: unknown, expectedRunId: st
     const item = rawRecords[idx] as Record<string, unknown> | null;
     if (!item || typeof item !== 'object') continue;
 
-    // 1. Strict runId correlation check
-    const recordRunId = typeof item.runId === 'string' ? item.runId.trim() : '';
-    if (recordRunId !== expectedRunId) continue;
-
-    // 2. Strict provenance check: only real UDP/53 authoritative logs allowed
-    if (item.observationMethod !== 'authoritative_dns_log') continue;
-
-    // 3. Anti-replay & freshness check: reject stale records older than 5 minutes
-    const rawObservedAt = typeof item.observedAt === 'string' ? item.observedAt : '';
-    if (rawObservedAt && !isFreshObservationTimestamp(rawObservedAt, nowMs)) {
+    // Strict validation using shared isValidDnsObservationRecord (enforces runId, QNAME p<N>.<runId>.<domain>, timestamp, and public IP)
+    if (!isValidDnsObservationRecord(item, expectedRunId, nowMs, expectedDomain)) {
       continue;
     }
 
-    // 4. Query name (qname) correlation check if present
-    const rawQname =
-      typeof item.queryName === 'string'
-        ? item.queryName.trim().toLowerCase().replace(/\.$/, '')
-        : typeof item.qname === 'string'
-          ? item.qname.trim().toLowerCase().replace(/\.$/, '')
-          : '';
-    if (rawQname && !rawQname.split('.').includes(expectedRunId.toLowerCase())) {
-      continue;
-    }
-
-    // 5. Strict globally routable public IP validation
     const rawIp = typeof item.primaryIp === 'string' ? item.primaryIp : typeof item.ip === 'string' ? item.ip : '';
     const canonicalIp = canonicalizeIp(rawIp);
-    if (!canonicalIp || !isGloballyRoutablePublicIp(canonicalIp)) continue;
-    if (seenIps.has(canonicalIp)) continue;
+    // Deduplicate by canonical primaryIp so repeated UDP queries (p1, p2, p3 or retries) from the same resolver are never counted as multiple witnesses
+    if (!canonicalIp || seenIps.has(canonicalIp)) continue;
     seenIps.add(canonicalIp);
+
+    const rawQname =
+      typeof item.queryName === 'string'
+        ? item.queryName
+        : typeof item.qname === 'string'
+          ? item.qname
+          : '';
+    const parsedQname = parseDnsLeakProbeQname(rawQname, expectedDomain);
+    if (!parsedQname.valid) continue;
 
     validResolvers.push({
       id: typeof item.id === 'string' && item.id ? item.id : `auth-${expectedRunId.slice(0, 8)}-${idx}`,
@@ -307,8 +354,8 @@ function sanitizeValidatedResolversForRun(rawRecords: unknown, expectedRunId: st
           ? item.countryCode.trim().toUpperCase()
           : undefined,
       runId: expectedRunId,
-      queryName: rawQname || undefined,
-      observedAt: rawObservedAt || new Date(nowMs).toISOString(),
+      queryName: parsedQname.qname,
+      observedAt: String(item.observedAt).trim(),
       status: 'مشاهده‌شده در Authoritative DNS (UDP/53)',
       responseTimeMs: typeof item.responseTimeMs === 'number' && Number.isFinite(item.responseTimeMs) ? item.responseTimeMs : null,
       isEncryptedDoH: typeof item.isEncryptedDoH === 'boolean' ? item.isEncryptedDoH : null,
@@ -613,7 +660,7 @@ export default {
       const body = parsedBody.data;
 
       const runId = typeof body?.runId === 'string' ? body.runId.trim() : '';
-      if (!VALID_RUN_ID_REGEX.test(runId)) {
+      if (!isValidDnsRunId(runId)) {
         return Response.json(
           { success: false, errorCode: 'INVALID_RUN_ID', error: 'شناسهٔ نشست (runId) نامعتبر است.' },
           { status: 400, headers: securityAndCorsHeaders }
@@ -633,38 +680,48 @@ export default {
         );
       }
 
-      // Timestamp freshness / anti-replay validation
-      const nowMs = Date.now();
-      let finalObservedAt = new Date(nowMs).toISOString();
-      if (body?.observedAt !== undefined && body?.observedAt !== null) {
-        if (!isFreshObservationTimestamp(body.observedAt, nowMs)) {
-          return Response.json(
-            {
-              success: false,
-              errorCode: 'STALE_OR_FUTURE_TIMESTAMP',
-              error: 'زمان مشاهدهٔ رویداد (observedAt) منقضی‌شده، قدیمی یا خارج از بازهٔ مجاز است (محافظت در برابر Replay).',
-            },
-            { status: 400, headers: securityAndCorsHeaders }
-          );
-        }
-        finalObservedAt = String(body.observedAt).trim();
+      // Timestamp freshness validation: observedAt is strictly mandatory
+      if (typeof body?.observedAt !== 'string' || !body.observedAt.trim()) {
+        return Response.json(
+          {
+            success: false,
+            errorCode: 'MISSING_OBSERVED_AT',
+            error: 'برچسب زمانی مشاهدهٔ رویداد (observedAt) الزامی است.',
+          },
+          { status: 400, headers: securityAndCorsHeaders }
+        );
       }
 
-      // Validate qname correlation with runId and configured DNS_LEAK_DOMAIN
-      const qname = typeof body?.qname === 'string' ? body.qname.trim().toLowerCase().replace(/\.$/, '') : '';
+      const nowMs = Date.now();
+      if (!isFreshObservationTimestamp(body.observedAt, nowMs)) {
+        return Response.json(
+          {
+            success: false,
+            errorCode: 'STALE_OR_FUTURE_TIMESTAMP',
+            error: 'زمان مشاهدهٔ رویداد (observedAt) منقضی‌شده، قدیمی یا خارج از بازهٔ ۵ دقیقه‌ای مجاز نشست است.',
+          },
+          { status: 400, headers: securityAndCorsHeaders }
+        );
+      }
+      const finalObservedAt = String(body.observedAt).trim();
+
+      // Mandatory canonical QNAME (`p<N>.<runId>.<domain>`) correlation with runId and configured DNS_LEAK_DOMAIN
+      const rawQname = typeof body?.qname === 'string' ? body.qname.trim() : '';
+      if (!rawQname) {
+        return Response.json(
+          {
+            success: false,
+            errorCode: 'MISSING_QNAME',
+            error: 'نام دامنهٔ استعلام‌شده (qname) در قالب p<N>.<runId>.<domain> الزامی است.',
+          },
+          { status: 400, headers: securityAndCorsHeaders }
+        );
+      }
+
       const configuredDomain = (env.DNS_LEAK_DOMAIN || '').trim().toLowerCase().replace(/^\.+|\.+$/g, '');
-      if (qname) {
-        if (!qname.split('.').includes(runId.toLowerCase())) {
-          return Response.json(
-            {
-              success: false,
-              errorCode: 'QNAME_RUN_ID_MISMATCH',
-              error: 'نام دامنهٔ استعلام‌شده (qname) با شناسهٔ نشست (runId) هم‌خوانی ندارد.',
-            },
-            { status: 400, headers: securityAndCorsHeaders }
-          );
-        }
-        if (configuredDomain && !qname.endsWith(`.${configuredDomain}`)) {
+      const parsedQname = parseDnsLeakProbeQname(rawQname, configuredDomain || null);
+      if (!parsedQname.valid) {
+        if (parsedQname.errorCode === 'QNAME_DOMAIN_MISMATCH') {
           return Response.json(
             {
               success: false,
@@ -674,6 +731,25 @@ export default {
             { status: 400, headers: securityAndCorsHeaders }
           );
         }
+        return Response.json(
+          {
+            success: false,
+            errorCode: 'INVALID_QNAME_FORMAT',
+            error: 'قالب نام دامنهٔ استعلام‌شده (qname) نامعتبر است؛ قالب مجاز p<N>.<runId>.<domain> است.',
+          },
+          { status: 400, headers: securityAndCorsHeaders }
+        );
+      }
+
+      if (parsedQname.runId !== runId.toLowerCase()) {
+        return Response.json(
+          {
+            success: false,
+            errorCode: 'QNAME_RUN_ID_MISMATCH',
+            error: 'نام دامنهٔ استعلام‌شده (qname) با شناسهٔ نشست (runId) هم‌خوانی ندارد.',
+          },
+          { status: 400, headers: securityAndCorsHeaders }
+        );
       }
 
       const kvKey = `dns:${runId}`;
@@ -697,7 +773,7 @@ export default {
         location: typeof body?.country === 'string' && body.country.trim() ? body.country.trim() : 'مشاهده‌شده در UDP/53',
         countryCode: typeof body?.countryCode === 'string' && body.countryCode.trim() ? body.countryCode.trim().toUpperCase() : undefined,
         runId,
-        queryName: qname || undefined,
+        queryName: parsedQname.qname,
         observedAt: finalObservedAt,
         status: 'مشاهده‌شده در Authoritative DNS (UDP/53)',
         responseTimeMs: null,
@@ -705,7 +781,11 @@ export default {
         observationMethod: 'authoritative_dns_log' as const,
       };
 
-      const merged = sanitizeValidatedResolversForRun([...existingList, newRecord], runId).slice(0, 32);
+      const merged = sanitizeValidatedResolversForRun(
+        [...existingList, newRecord],
+        runId,
+        configuredDomain || null
+      ).slice(0, 32);
       await env.DNS_LOGS_KV.put(kvKey, JSON.stringify(merged), { expirationTtl: 300 });
 
       return Response.json(
@@ -746,13 +826,14 @@ export default {
       }
 
       const rawRunId = url.searchParams.get('runId') || '';
-      if (!VALID_RUN_ID_REGEX.test(rawRunId)) {
+      if (!isValidDnsRunId(rawRunId)) {
         return Response.json(
           { success: false, errorCode: 'INVALID_RUN_ID', error: 'شناسهٔ نشست (runId) نامعتبر است.' },
           { status: 400, headers: securityAndCorsHeaders }
         );
       }
 
+      const configuredDomain = (env.DNS_LEAK_DOMAIN || '').trim().toLowerCase().replace(/^\.+|\.+$/g, '');
       const raw = await env.DNS_LOGS_KV.get(`dns:${rawRunId}`);
       let parsed: unknown = [];
       if (raw) {
@@ -763,7 +844,7 @@ export default {
         }
       }
 
-      const resolvers = sanitizeValidatedResolversForRun(parsed, rawRunId);
+      const resolvers = sanitizeValidatedResolversForRun(parsed, rawRunId, configuredDomain || null);
       return Response.json(
         {
           success: true,
@@ -786,7 +867,7 @@ export default {
       }
 
       const rawRunId = url.searchParams.get('runId') || '';
-      const runId = VALID_RUN_ID_REGEX.test(rawRunId) ? rawRunId : crypto.randomUUID();
+      const runId = isValidDnsRunId(rawRunId) ? rawRunId : crypto.randomUUID();
       const startedAt = new Date().toISOString();
       const dnsConfig = isAuthoritativeDnsFullyConfigured(env);
 
@@ -818,7 +899,7 @@ export default {
         }
       }
 
-      const resolvers = sanitizeValidatedResolversForRun(parsed, runId);
+      const resolvers = sanitizeValidatedResolversForRun(parsed, runId, dnsConfig.dnsLeakDomain);
       return Response.json(
         {
           success: true,

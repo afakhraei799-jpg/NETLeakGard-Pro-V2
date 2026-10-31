@@ -16,6 +16,9 @@ import {
   isGloballyRoutablePublicIp,
   isPrivateOrLocalAddress,
   isSafeExternalUrl,
+  isValidDnsObservationRecord,
+  isValidDnsRunId,
+  parseDnsLeakProbeQname,
   validateAiAuditPayload
 } from './src/utils/networkEvaluator';
 
@@ -721,7 +724,7 @@ app.get('/api/health', (_req, res) => {
 app.get('/api/dns-leak-probe', rateLimit(30, 60_000, 'dns-leak-probe'), async (req, res) => {
   const startedAt = new Date().toISOString();
   const runId =
-    typeof req.query.runId === 'string' && /^[a-zA-Z0-9-]{8,64}$/.test(req.query.runId)
+    typeof req.query.runId === 'string' && isValidDnsRunId(req.query.runId)
       ? req.query.runId
       : crypto.randomUUID();
 
@@ -805,44 +808,46 @@ app.get('/api/dns-leak-probe', rateLimit(30, 60_000, 'dns-leak-probe'), async (r
 
     const collectorData = collectorResp.data;
     const nowMs = Date.now();
-    const MAX_AGE_MS = 5 * 60 * 1000;
-    const MAX_SKEW_MS = 60 * 1000;
+    const seenCanonicalIps = new Set<string>();
+    const observedResolvers: any[] = [];
 
-    const observedResolvers = Array.isArray(collectorData?.resolvers)
-      ? collectorData.resolvers
-          .filter((r: any) => {
-            if (!r || typeof r !== 'object') return false;
-            // Require explicit runId match from collector
-            const recRunId = typeof r.runId === 'string' ? r.runId.trim() : '';
-            if (recRunId && recRunId !== runId) return false;
-            const rawIp = String(r.ip || r.primaryIp || '');
-            if (!isPublicRoutableIp(rawIp)) return false;
-            // If observedAt is present, reject stale/replayed records (>5 min old)
-            if (typeof r.observedAt === 'string' && r.observedAt.trim()) {
-              const ts = Date.parse(r.observedAt);
-              if (!Number.isFinite(ts) || nowMs - ts > MAX_AGE_MS || nowMs - ts < -MAX_SKEW_MS) {
-                return false;
-              }
-            }
-            return true;
-          })
-          .map((r: any, idx: number) => ({
-            id: String(r.id || `auth-${idx}`),
-            name: String(r.name || r.isp || 'Observed Recursive Resolver'),
-            primaryIp: normalizeIp(String(r.ip || r.primaryIp)) || String(r.ip || r.primaryIp),
-            asn: r.asn ? String(r.asn) : undefined,
-            isp: r.isp ? String(r.isp) : undefined,
-            location: String(r.location || r.country || 'نامشخص'),
-            countryCode: r.countryCode || r.country_code ? String(r.countryCode || r.country_code) : undefined,
-            runId: typeof r.runId === 'string' && r.runId.trim() ? r.runId.trim() : runId,
-            queryName: typeof (r.queryName || r.qname) === 'string' ? String(r.queryName || r.qname) : undefined,
-            observedAt: typeof r.observedAt === 'string' ? r.observedAt : undefined,
-            status: String(r.status || 'مشاهده‌شده در Authoritative DNS'),
-            responseTimeMs: typeof r.responseTimeMs === 'number' ? r.responseTimeMs : null,
-            isEncryptedDoH: typeof r.isEncryptedDoH === 'boolean' ? r.isEncryptedDoH : null,
-            observationMethod: 'authoritative_dns_log' as const,
-          }))
-      : [];
+    if (Array.isArray(collectorData?.resolvers)) {
+      for (let idx = 0; idx < collectorData.resolvers.length; idx++) {
+        const r = collectorData.resolvers[idx];
+        if (!isValidDnsObservationRecord(r, runId, nowMs, dnsLeakDomain)) {
+          continue;
+        }
+        const canonicalIp = canonicalizeIp(String(r.ip || r.primaryIp || ''));
+        // Deduplicate by canonical IP so repeated queries (p1, p2, p3) from the same resolver are never counted as multiple witnesses
+        if (!canonicalIp || seenCanonicalIps.has(canonicalIp)) {
+          continue;
+        }
+        seenCanonicalIps.add(canonicalIp);
+
+        const rawQname = typeof r.queryName === 'string' ? r.queryName : typeof r.qname === 'string' ? r.qname : '';
+        const parsedQname = parseDnsLeakProbeQname(rawQname, dnsLeakDomain);
+        if (!parsedQname.valid) {
+          continue;
+        }
+
+        observedResolvers.push({
+          id: String(r.id || `auth-${idx}`),
+          name: String(r.name || r.isp || 'Observed Recursive Resolver'),
+          primaryIp: canonicalIp,
+          asn: r.asn ? String(r.asn) : undefined,
+          isp: r.isp ? String(r.isp) : undefined,
+          location: String(r.location || r.country || 'نامشخص'),
+          countryCode: r.countryCode || r.country_code ? String(r.countryCode || r.country_code).toUpperCase() : undefined,
+          runId,
+          queryName: parsedQname.qname,
+          observedAt: String(r.observedAt).trim(),
+          status: String(r.status || 'مشاهده‌شده در Authoritative DNS'),
+          responseTimeMs: typeof r.responseTimeMs === 'number' ? r.responseTimeMs : null,
+          isEncryptedDoH: typeof r.isEncryptedDoH === 'boolean' ? r.isEncryptedDoH : null,
+          observationMethod: 'authoritative_dns_log' as const,
+        });
+      }
+    }
 
     return res.json({
       success: true,

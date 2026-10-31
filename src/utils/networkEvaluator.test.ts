@@ -20,6 +20,11 @@ import {
   evaluatePortLeakResult,
   evaluateOverallSummary,
   evaluateObservedIpSources,
+  isValidDnsObservationRecord,
+  isValidDnsRunId,
+  isValidDnsLeakBaseDomain,
+  buildDnsLeakProbeQname,
+  parseDnsLeakProbeQname,
   validateAiAuditPayload
 } from './networkEvaluator';
 import { createBoundedSignal } from '../services/networkTester';
@@ -30,6 +35,8 @@ import {
   initGlobeWebGLSafe,
 } from '../components/Globe3D';
 import cloudflareWorker, { type Env as CloudflareEnv } from '../../cloudflare/worker';
+// @ts-ignore
+import { extractRunIdFromQname, parseDnsLeakQname, evaluateDnsQueryPacket } from '../../cloudflare/authoritative-dns-udp53.mjs';
 
 test('IP validation and RFC1918/mDNS private address classification', () => {
   assert.equal(isValidIpv4('1.1.1.1'), true);
@@ -201,6 +208,9 @@ test('evaluateDnsTestResult marks unconfigured authoritative DNS as NOT_CONFIGUR
         asn: 'AS58224',
         isp: 'TCI',
         location: 'IR',
+        runId: 'test-token-5678',
+        queryName: 'p1.test-token-5678.leak.example.com',
+        observedAt: now,
         status: 'مغایرت کشور با تونل (Leak)',
         responseTimeMs: 32,
         isEncryptedDoH: false,
@@ -285,7 +295,7 @@ test('evaluateOverallSummary refuses to compute a numeric score when evidence is
   const now = new Date().toISOString();
 
   const unconfiguredDns = evaluateDnsTestResult({
-    runId: 'run-1',
+    runId: 'run-test-0001',
     authoritativeConfigured: false,
     resolvers: [],
     ipDetails: null,
@@ -334,7 +344,7 @@ test('evaluateOverallSummary refuses to compute a numeric score when evidence is
 
   // Complete when Authoritative DNS is configured and returns verified resolvers
   const configuredDns = evaluateDnsTestResult({
-    runId: 'run-2',
+    runId: 'run-test-0002',
     authoritativeConfigured: true,
     resolvers: [
       {
@@ -344,6 +354,9 @@ test('evaluateOverallSummary refuses to compute a numeric score when evidence is
         asn: 'AS13335',
         isp: 'Cloudflare, Inc.',
         location: 'Anycast',
+        runId: 'run-test-0002',
+        queryName: 'p1.run-test-0002.leak.example.com',
+        observedAt: now,
         status: 'مشاهده‌شده در Authoritative DNS',
         responseTimeMs: 12,
         isEncryptedDoH: true,
@@ -791,6 +804,9 @@ test('WebRTC UNSUPPORTED, ERROR, INCONCLUSIVE, or NOT_CONFIGURED never produce o
         asn: 'AS13335',
         isp: 'Cloudflare, Inc.',
         location: 'Anycast',
+        runId: 'run-valid-100',
+        queryName: 'p1.run-valid-100.leak.example.com',
+        observedAt: now,
         status: 'OK',
         responseTimeMs: 10,
         isEncryptedDoH: true,
@@ -866,6 +882,9 @@ test('evaluateDnsTestResult ignores status text strings and requires structured 
         name: 'Unknown Resolver',
         primaryIp: '9.9.9.9',
         location: 'DE',
+        runId: 'run-bare-1',
+        queryName: 'p1.run-bare-1.leak.example.com',
+        observedAt: now,
         status: 'مغایرت کشور با تونل (Leak)', // Even with "Leak" / "مغایرت" in status string, must NOT trigger LEAK_DETECTED!
         responseTimeMs: 20,
         isEncryptedDoH: null,
@@ -891,6 +910,9 @@ test('evaluateDnsTestResult ignores status text strings and requires structured 
         asn: 'AS24940', // Same ASN as tunnel!
         isp: 'Hetzner Online GmbH',
         location: 'NL', // Different country (Netherlands vs Germany)
+        runId: 'run-country-diff',
+        queryName: 'p1.run-country-diff.leak.example.com',
+        observedAt: now,
         status: 'Leak', // Status text must be ignored
         responseTimeMs: 15,
         isEncryptedDoH: false,
@@ -917,6 +939,8 @@ test('evaluateDnsTestResult ignores status text strings and requires structured 
         isp: 'Cloudflare, Inc.',
         location: 'Anycast',
         runId: 'run-stale-999',
+        queryName: 'p1.run-stale-999.leak.example.com',
+        observedAt: now,
         status: 'OK',
         responseTimeMs: 12,
         isEncryptedDoH: true,
@@ -943,6 +967,9 @@ test('evaluateDnsTestResult ignores status text strings and requires structured 
         asn: 'AS13335',
         isp: 'Cloudflare, Inc.',
         location: 'Anycast',
+        runId: 'run-no-ip',
+        queryName: 'p1.run-no-ip.leak.example.com',
+        observedAt: now,
         status: 'OK',
         responseTimeMs: 12,
         isEncryptedDoH: true,
@@ -1428,6 +1455,7 @@ test('Cloudflare Worker keeps DNS test NOT_CONFIGURED until UDP/53 is verified a
         asn: 'AS19281',
         countryCode: 'CH',
         qname: 'p1.run-12345678.leak.example.com',
+        observedAt: new Date().toISOString(),
       }),
     }),
     verifiedEnv
@@ -1483,6 +1511,7 @@ test('DNS anti-replay, stale timestamp rejection, CGNAT/TEST-NET rejection, toke
         location: 'CH',
         countryCode: 'CH',
         runId: 'run-fresh-001',
+        queryName: 'p1.run-fresh-001.leak.example.com',
         observedAt: staleIso,
         status: 'Observed',
         responseTimeMs: null,
@@ -1511,6 +1540,8 @@ test('DNS anti-replay, stale timestamp rejection, CGNAT/TEST-NET rejection, toke
         location: 'DE',
         countryCode: 'DE',
         runId: 'run-cgnat-001',
+        queryName: 'p1.run-cgnat-001.leak.example.com',
+        observedAt: nowIso,
         status: 'Observed',
         responseTimeMs: null,
         isEncryptedDoH: null,
@@ -1591,6 +1622,7 @@ test('DNS anti-replay, stale timestamp rejection, CGNAT/TEST-NET rejection, toke
         runId: 'run-rot-12345678',
         resolverIp: '8.8.8.8',
         qname: 'p2.run-rot-12345678.evil.example.org',
+        observedAt: new Date().toISOString(),
       }),
     }),
     rotationEnv
@@ -1666,6 +1698,546 @@ test('Cloudflare Worker Static Assets binding, API routes, and wrangler.toml con
   assert.ok(portScanJson.ports.every((p: any) => p.state === 'not_tested'));
 });
 
+test('isValidDnsObservationRecord and DNS evidence validation strictly enforce runId, timestamps, anti-replay, and public IP ranges', async () => {
+  const now = Date.now();
+  const validIso = new Date(now).toISOString();
+  const validRunId = 'run-strict-001';
 
+  const baseRecord = {
+    id: 'res-1',
+    name: 'Quad9 DNS',
+    primaryIp: '9.9.9.9',
+    asn: 'AS19281',
+    isp: 'Quad9',
+    location: 'CH',
+    countryCode: 'CH',
+    runId: validRunId,
+    queryName: `p1.${validRunId}.leak.example.com`,
+    observedAt: validIso,
+    status: 'Observed',
+    responseTimeMs: 25,
+    isEncryptedDoH: true,
+    observationMethod: 'authoritative_dns_log' as const,
+  };
 
+  // 1. Positive case: valid public IPv4 + matching runId + canonical queryName + fresh timestamp -> true
+  assert.equal(isValidDnsObservationRecord(baseRecord, validRunId, now), true);
+
+  // 2. Positive case: valid public IPv6 (Quad9 IPv6 2620:fe::fe) -> true
+  assert.equal(
+    isValidDnsObservationRecord({ ...baseRecord, primaryIp: '2620:fe::fe' }, validRunId, now),
+    true
+  );
+
+  // 3. Negative case: missing runId -> false
+  assert.equal(isValidDnsObservationRecord({ ...baseRecord, runId: '' }, validRunId, now), false);
+  assert.equal(isValidDnsObservationRecord({ ...baseRecord, runId: undefined }, validRunId, now), false);
+
+  // 4. Negative case: mismatched runId -> false
+  assert.equal(isValidDnsObservationRecord({ ...baseRecord, runId: 'run-different-999' }, validRunId, now), false);
+
+  // 5. Negative case: missing observedAt -> false
+  assert.equal(isValidDnsObservationRecord({ ...baseRecord, observedAt: '' }, validRunId, now), false);
+  assert.equal(isValidDnsObservationRecord({ ...baseRecord, observedAt: undefined }, validRunId, now), false);
+
+  // 6. Negative case: unparseable/invalid observedAt string -> false
+  assert.equal(isValidDnsObservationRecord({ ...baseRecord, observedAt: 'not-a-valid-date' }, validRunId, now), false);
+
+  // 7. Negative case: stale observedAt (> 5 minutes old) -> false
+  const staleIso = new Date(now - 6 * 60 * 1000).toISOString();
+  assert.equal(isValidDnsObservationRecord({ ...baseRecord, observedAt: staleIso }, validRunId, now), false);
+
+  // 8. Negative case: future observedAt (> 60s in future) -> false
+  const futureIso = new Date(now + 90 * 1000).toISOString();
+  assert.equal(isValidDnsObservationRecord({ ...baseRecord, observedAt: futureIso }, validRunId, now), false);
+
+  // 9. Negative cases: Non-public / reserved IP ranges -> false
+  const nonPublicIps = [
+    '127.0.0.1', // Loopback IPv4
+    '::1', // Loopback IPv6
+    '10.0.0.1', // RFC1918 Private
+    '192.168.1.1', // RFC1918 Private
+    '172.16.5.1', // RFC1918 Private
+    '100.64.0.1', // RFC6598 CGNAT
+    '169.254.169.254', // Link-local / Cloud metadata
+    'fe80::1', // Link-local IPv6
+    'fc00::1', // Unique Local IPv6 (ULA)
+    '224.0.0.1', // Multicast IPv4
+    'ff02::1', // Multicast IPv6
+    '192.0.2.1', // TEST-NET-1 Documentation
+    '198.51.100.1', // TEST-NET-2 Documentation
+    '203.0.113.1', // TEST-NET-3 Documentation
+    '2001:db8::1', // Documentation IPv6
+    '::ffff:192.168.1.1', // IPv4-mapped IPv6 private
+  ];
+  for (const nonPublicIp of nonPublicIps) {
+    assert.equal(
+      isValidDnsObservationRecord({ ...baseRecord, primaryIp: nonPublicIp }, validRunId, now),
+      false,
+      `Failed to reject non-public IP: ${nonPublicIp}`
+    );
+  }
+
+  // 10. Negative case: queryName missing or mismatch vs runId -> false
+  assert.equal(
+    isValidDnsObservationRecord({ ...baseRecord, queryName: '' }, validRunId, now),
+    false
+  );
+  assert.equal(
+    isValidDnsObservationRecord({ ...baseRecord, queryName: undefined }, validRunId, now),
+    false
+  );
+  assert.equal(
+    isValidDnsObservationRecord(
+      { ...baseRecord, queryName: 'p1.other-run-token.leak.example.com' },
+      validRunId,
+      now
+    ),
+    false
+  );
+
+  // 11. Positive case: queryName contains matching runId -> true
+  assert.equal(
+    isValidDnsObservationRecord(
+      { ...baseRecord, queryName: `p1.${validRunId}.leak.example.com` },
+      validRunId,
+      now
+    ),
+    true
+  );
+
+  // 12. Negative case: invalid observationMethod -> false
+  assert.equal(
+    isValidDnsObservationRecord(
+      { ...baseRecord, observationMethod: 'browser_edns_client_subnet' as any },
+      validRunId,
+      now
+    ),
+    false
+  );
+
+  // 13. Test evaluateDnsTestResult behavior on missing runId in resolver records -> INCONCLUSIVE (RUN_ID_MISMATCH)
+  const missingRunIdResult = evaluateDnsTestResult({
+    runId: validRunId,
+    authoritativeConfigured: true,
+    resolvers: [
+      {
+        ...baseRecord,
+        runId: '',
+      },
+    ],
+    ipDetails: { status: 'PASS', ip: '185.220.101.5', countryCode: 'DE', asn: 'AS200000', isp: 'VPN' } as any,
+    startedAt: validIso,
+    completedAt: validIso,
+  });
+  assert.equal(missingRunIdResult.status, 'INCONCLUSIVE');
+  assert.equal(missingRunIdResult.errorCode, 'RUN_ID_MISMATCH');
+
+  // 14. Test evaluateDnsTestResult behavior on missing observedAt in resolver records -> INCONCLUSIVE (STALE_DNS_OBSERVATION)
+  const missingTimestampResult = evaluateDnsTestResult({
+    runId: validRunId,
+    authoritativeConfigured: true,
+    resolvers: [
+      {
+        ...baseRecord,
+        observedAt: '',
+      },
+    ],
+    ipDetails: { status: 'PASS', ip: '185.220.101.5', countryCode: 'DE', asn: 'AS200000', isp: 'VPN' } as any,
+    startedAt: validIso,
+    completedAt: validIso,
+  });
+  assert.equal(missingTimestampResult.status, 'INCONCLUSIVE');
+  assert.equal(missingTimestampResult.errorCode, 'STALE_DNS_OBSERVATION');
+
+  // 15. Test streaming chunked request without Content-Length exceeding 32KB payload
+  const oversizedChunk = new Uint8Array(20 * 1024); // 20KB chunk
+  oversizedChunk.fill(65); // 'A'
+  const chunkedStream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(oversizedChunk);
+      controller.enqueue(oversizedChunk); // Total 40KB > 32KB limit
+      controller.close();
+    },
+  });
+
+  const workerEnv: any = {
+    DNS_LEAK_DOMAIN: 'leak.example.com',
+    DNS_COLLECTOR_API_TOKEN: 'secret-token-test',
+    DNS_UDP53_VERIFIED: 'true',
+    DNS_LOGS_KV: { async get() { return null; }, async put() {} },
+  };
+
+  const streamOverLimitReq = new Request('https://example.workers.dev/api/dns-collector/ingest', {
+    method: 'POST',
+    headers: {
+      Authorization: 'Bearer secret-token-test',
+      'Content-Type': 'application/json',
+      // Note: No Content-Length header provided! Stream reader must abort and return 413
+    },
+    body: chunkedStream,
+    // @ts-ignore
+    duplex: 'half',
+  });
+
+  const streamOverLimitRes = await cloudflareWorker.fetch(streamOverLimitReq, workerEnv);
+  assert.equal(streamOverLimitRes.status, 413);
+  const streamOverLimitJson: any = await streamOverLimitRes.json();
+  assert.equal(streamOverLimitJson.errorCode, 'PAYLOAD_TOO_LARGE');
+
+  // 16. Ingest without observedAt is rejected with 400 MISSING_OBSERVED_AT
+  const missingObservedAtReq = new Request('https://example.workers.dev/api/dns-collector/ingest', {
+    method: 'POST',
+    headers: {
+      Authorization: 'Bearer secret-token-test',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      runId: validRunId,
+      resolverIp: '9.9.9.9',
+      qname: `p1.${validRunId}.leak.example.com`,
+      // observedAt omitted!
+    }),
+  });
+  const missingObservedAtRes = await cloudflareWorker.fetch(missingObservedAtReq, workerEnv);
+  assert.equal(missingObservedAtRes.status, 400);
+  const missingObservedAtJson: any = await missingObservedAtRes.json();
+  assert.equal(missingObservedAtJson.errorCode, 'MISSING_OBSERVED_AT');
+});
+
+test('Canonical QNAME format p<N>.<runId>.<domain> and UDP/53 responder extraction accurately extract UUIDv4 and reject malformed/wrong-domain names', () => {
+  const domain = 'leak.example.com';
+  const uuid = crypto.randomUUID(); // e.g. 550e8400-e29b-41d4-a716-446655440000 (36 chars)
+
+  // 1. Positive: Build & extract exact crypto.randomUUID() across probes p1, p2, p3
+  for (const probeNum of [1, 2, 3]) {
+    const qname = buildDnsLeakProbeQname(probeNum, uuid, domain);
+    assert.equal(qname, `p${probeNum}.${uuid.toLowerCase()}.${domain}`);
+
+    const parsedEval = parseDnsLeakProbeQname(qname, domain);
+    assert.equal(parsedEval.valid, true);
+    assert.equal(parsedEval.probeLabel, `p${probeNum}`);
+    assert.equal(parsedEval.probeNumber, probeNum);
+    assert.equal(parsedEval.runId, uuid.toLowerCase());
+    assert.equal(parsedEval.baseDomain, domain);
+    assert.equal(parsedEval.errorCode, null);
+
+    // Verify UDP/53 responder (`cloudflare/authoritative-dns-udp53.mjs`) extracts the exact UUID without prefix/suffix
+    const parsedUdp = parseDnsLeakQname(qname, domain);
+    assert.ok(parsedUdp);
+    assert.equal(parsedUdp.probeNumber, probeNum);
+    assert.equal(parsedUdp.runId, uuid.toLowerCase());
+    assert.equal(extractRunIdFromQname(qname, domain), uuid.toLowerCase());
+  }
+
+  // 2. Negative: Legacy hyphenated format `p1-<uuid>.<domain>` MUST be rejected (never extract `p1-<uuid>`)
+  const hyphenatedQname = `p1-${uuid}.${domain}`;
+  const hyphenEval = parseDnsLeakProbeQname(hyphenatedQname, domain);
+  assert.equal(hyphenEval.valid, false);
+  assert.equal(hyphenEval.errorCode, 'INVALID_QNAME_STRUCTURE');
+  assert.equal(extractRunIdFromQname(hyphenatedQname, domain), null);
+  assert.equal(parseDnsLeakQname(hyphenatedQname, domain), null);
+
+  // 3. Negative: Prefixed UUID placed in runId slot (`p1.p1-<uuid>.<domain>`) MUST be rejected
+  const prefixedSlotQname = `p1.p1-${uuid}.${domain}`;
+  assert.equal(isValidDnsRunId(`p1-${uuid}`), false);
+  assert.equal(parseDnsLeakProbeQname(prefixedSlotQname, domain).valid, false);
+  assert.equal(extractRunIdFromQname(prefixedSlotQname, domain), null);
+
+  // 4. Negative: Incomplete / invalid runId (too short < 8 chars, leading/trailing hyphen, > 63 chars)
+  assert.equal(buildDnsLeakProbeQname(1, 'short1', domain), null);
+  assert.equal(parseDnsLeakProbeQname(`p1.short1.${domain}`, domain).valid, false);
+  assert.equal(parseDnsLeakProbeQname(`p1.short1.${domain}`, domain).errorCode, 'INVALID_RUN_ID_LABEL');
+  assert.equal(extractRunIdFromQname(`p1.short1.${domain}`, domain), null);
+
+  assert.equal(parseDnsLeakProbeQname(`p1.-badstart123.${domain}`, domain).valid, false);
+  assert.equal(extractRunIdFromQname(`p1.-badstart123.${domain}`, domain), null);
+
+  const label64Chars = 'a'.repeat(64); // Exceeds RFC 1035 63-octet label limit
+  assert.equal(isValidDnsRunId(label64Chars), false);
+  assert.equal(parseDnsLeakProbeQname(`p1.${label64Chars}.${domain}`, domain).valid, false);
+  assert.equal(extractRunIdFromQname(`p1.${label64Chars}.${domain}`, domain), null);
+
+  // 5. Negative: Wrong domain
+  const wrongDomainQname = `p1.${uuid}.wrong.example.org`;
+  const wrongDomainRes = parseDnsLeakProbeQname(wrongDomainQname, domain);
+  assert.equal(wrongDomainRes.valid, false);
+  assert.equal(wrongDomainRes.errorCode, 'QNAME_DOMAIN_MISMATCH');
+  assert.equal(extractRunIdFromQname(wrongDomainQname, domain), null);
+
+  // 6. Negative: Invalid QNAME structure (missing probe label, extra subdomain labels, invalid probe label)
+  assert.equal(parseDnsLeakProbeQname(`${uuid}.${domain}`, domain).valid, false);
+  assert.equal(extractRunIdFromQname(`${uuid}.${domain}`, domain), null);
+
+  assert.equal(parseDnsLeakProbeQname(`extra.p1.${uuid}.${domain}`, domain).valid, false);
+  assert.equal(extractRunIdFromQname(`extra.p1.${uuid}.${domain}`, domain), null);
+
+  assert.equal(parseDnsLeakProbeQname(`x1.${uuid}.${domain}`, domain).valid, false);
+  assert.equal(parseDnsLeakProbeQname(`x1.${uuid}.${domain}`, domain).errorCode, 'INVALID_PROBE_LABEL');
+  assert.equal(extractRunIdFromQname(`x1.${uuid}.${domain}`, domain), null);
+
+  assert.equal(parseDnsLeakProbeQname(`p0.${uuid}.${domain}`, domain).valid, false);
+  assert.equal(extractRunIdFromQname(`p0.${uuid}.${domain}`, domain), null);
+
+  // 7. Base domain validation
+  assert.equal(isValidDnsLeakBaseDomain('leak.example.com'), true);
+  assert.equal(isValidDnsLeakBaseDomain('localhost'), false);
+  assert.equal(isValidDnsLeakBaseDomain('127.0.0.1'), false);
+});
+
+test('KV polling retention vs cross-run isolation and duplicate resolver deduplication work strictly', async () => {
+  const kvStore = new Map<string, string>();
+  const env: CloudflareEnv = {
+    DNS_LEAK_DOMAIN: 'leak.example.com',
+    DNS_COLLECTOR_API_TOKEN: 'secret-collector-token-2026',
+    DNS_UDP53_VERIFIED: 'true',
+    DNS_LOGS_KV: {
+      async get(k) {
+        return kvStore.get(k) ?? null;
+      },
+      async put(k, v) {
+        kvStore.set(k, v);
+      },
+    },
+  };
+
+  const runIdA = crypto.randomUUID();
+  const runIdB = crypto.randomUUID();
+  const nowIso = new Date().toISOString();
+
+  // 1. Ingest without qname is rejected with 400 MISSING_QNAME
+  const missingQnameRes = await cloudflareWorker.fetch(
+    new Request('https://example.workers.dev/api/dns-collector/ingest', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer secret-collector-token-2026',
+      },
+      body: JSON.stringify({
+        runId: runIdA,
+        resolverIp: '9.9.9.9',
+        observedAt: nowIso,
+      }),
+    }),
+    env
+  );
+  assert.equal(missingQnameRes.status, 400);
+  const missingQnameJson: any = await missingQnameRes.json();
+  assert.equal(missingQnameJson.errorCode, 'MISSING_QNAME');
+
+  // 2. Ingest with legacy hyphenated qname `p1-<runId>.leak.example.com` is rejected with 400 INVALID_QNAME_FORMAT
+  const badFormatRes = await cloudflareWorker.fetch(
+    new Request('https://example.workers.dev/api/dns-collector/ingest', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer secret-collector-token-2026',
+      },
+      body: JSON.stringify({
+        runId: runIdA,
+        resolverIp: '9.9.9.9',
+        qname: `p1-${runIdA}.leak.example.com`,
+        observedAt: nowIso,
+      }),
+    }),
+    env
+  );
+  assert.equal(badFormatRes.status, 400);
+  const badFormatJson: any = await badFormatRes.json();
+  assert.equal(badFormatJson.errorCode, 'INVALID_QNAME_FORMAT');
+
+  // 3. Ingest 3 probes (p1, p2, p3) for runIdA all resolved by the SAME recursive resolver IP (9.9.9.9)
+  for (const probeNum of [1, 2, 3]) {
+    const ingestRes = await cloudflareWorker.fetch(
+      new Request('https://example.workers.dev/api/dns-collector/ingest', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer secret-collector-token-2026',
+        },
+        body: JSON.stringify({
+          runId: runIdA,
+          resolverIp: probeNum === 2 ? '::ffff:9.9.9.9' : '9.9.9.9',
+          isp: 'Quad9',
+          asn: 'AS19281',
+          countryCode: 'CH',
+          qname: `p${probeNum}.${runIdA}.leak.example.com`,
+          observedAt: nowIso,
+        }),
+      }),
+      env
+    );
+    assert.equal(ingestRes.status, 200);
+  }
+
+  // 4. Sequential polling for runIdA succeeds across multiple polls AND deduplicates 9.9.9.9 to a SINGLE resolver witness (not 3!)
+  for (let pollAttempt = 1; pollAttempt <= 2; pollAttempt++) {
+    const pollRes = await cloudflareWorker.fetch(
+      new Request(`https://example.workers.dev/api/dns-leak-probe?runId=${runIdA}`),
+      env
+    );
+    assert.equal(pollRes.status, 200);
+    const pollJson: any = await pollRes.json();
+    assert.equal(pollJson.resolvers.length, 1);
+    assert.equal(pollJson.resolvers[0].primaryIp, '9.9.9.9');
+    assert.equal(pollJson.resolvers[0].runId, runIdA);
+    assert.equal(pollJson.resolvers[0].queryName, `p1.${runIdA}.leak.example.com`);
+  }
+
+  // 5. Cross-run isolation: Polling for runIdB returns 0 resolvers (cannot reuse runIdA's evidence)
+  const pollResB = await cloudflareWorker.fetch(
+    new Request(`https://example.workers.dev/api/dns-leak-probe?runId=${runIdB}`),
+    env
+  );
+  const pollJsonB: any = await pollResB.json();
+  assert.equal(pollJsonB.resolvers.length, 0);
+
+  // 6.Even if KV or collector returns runIdA's record when evaluating runIdB, evaluateDnsTestResult rejects it as RUN_ID_MISMATCH (INCONCLUSIVE)
+  const crossRunEval = evaluateDnsTestResult({
+    runId: runIdB,
+    authoritativeConfigured: true,
+    dnsLeakDomain: 'leak.example.com',
+    resolvers: [
+      {
+        id: 'stolen-rec',
+        name: 'Quad9',
+        primaryIp: '9.9.9.9',
+        asn: 'AS19281',
+        isp: 'Quad9',
+        location: 'CH',
+        countryCode: 'CH',
+        runId: runIdB, // Attacker rewrote runId field, but queryName still belongs to runIdA!
+        queryName: `p1.${runIdA}.leak.example.com`,
+        observedAt: nowIso,
+        status: 'Observed',
+        responseTimeMs: 15,
+        isEncryptedDoH: true,
+        observationMethod: 'authoritative_dns_log',
+      },
+    ],
+    ipDetails: { status: 'PASS', ip: '9.9.9.9', countryCode: 'CH', asn: 'AS19281', isp: 'Quad9' } as any,
+    startedAt: nowIso,
+    completedAt: nowIso,
+  });
+  assert.equal(crossRunEval.status, 'INCONCLUSIVE');
+  assert.equal(crossRunEval.errorCode, 'RUN_ID_MISMATCH');
+});
+
+test('Authoritative UDP/53 DNS packet responder enforces RFC 1035 QR=1 ignore, FORMERR, REFUSED, NXDOMAIN, NOTIMP, and NOERROR', () => {
+  const allowedDomain = 'leak.example.com';
+  const validRunId = crypto.randomUUID().toLowerCase();
+
+  function encodeDnsQueryPacket(params: {
+    txId?: number;
+    flags?: number;
+    qname: string;
+    qtype?: number;
+    qclass?: number;
+  }): Buffer {
+    const { txId = 0x1a2b, flags = 0x0100, qname, qtype = 1, qclass = 1 } = params;
+    const header = Buffer.alloc(12);
+    header.writeUInt16BE(txId, 0);
+    header.writeUInt16BE(flags, 2);
+    header.writeUInt16BE(1, 4); // QDCOUNT = 1
+
+    const labelBuffers: Buffer[] = [];
+    for (const label of qname.split('.').filter(Boolean)) {
+      const ascii = Buffer.from(label, 'ascii');
+      labelBuffers.push(Buffer.from([ascii.length]), ascii);
+    }
+    labelBuffers.push(Buffer.from([0x00])); // Root null terminator
+
+    const tail = Buffer.alloc(4);
+    tail.writeUInt16BE(qtype, 0);
+    tail.writeUInt16BE(qclass, 2);
+
+    return Buffer.concat([header, ...labelBuffers, tail]);
+  }
+
+  // 1. Valid A query (QTYPE=1) for p1.<runId>.leak.example.com -> NOERROR (RCODE=0, AA=1, ANCOUNT=1) + observation extracted
+  const validAQuery = encodeDnsQueryPacket({
+    txId: 0x4321,
+    qname: `p1.${validRunId}.${allowedDomain}`,
+    qtype: 1,
+  });
+  const resA = evaluateDnsQueryPacket(validAQuery, allowedDomain);
+  assert.equal(resA.ignore, false);
+  assert.equal(resA.rcode, 0);
+  assert.ok(resA.responseBuffer);
+  assert.equal(resA.responseBuffer.readUInt16BE(0), 0x4321); // Preserves TXID
+  assert.equal((resA.responseBuffer.readUInt16BE(2) & 0x8000) !== 0, true); // QR=1
+  assert.equal((resA.responseBuffer.readUInt16BE(2) & 0x0400) !== 0, true); // AA=1
+  assert.equal(resA.responseBuffer.readUInt16BE(2) & 0x000f, 0); // RCODE=0 (NOERROR)
+  assert.equal(resA.responseBuffer.readUInt16BE(6), 1); // ANCOUNT=1 (0.0.0.0 A record)
+  assert.ok(resA.observation);
+  assert.equal(resA.observation.runId, validRunId);
+  assert.equal(resA.observation.probeNumber, 1);
+
+  // 2. Valid AAAA query (QTYPE=28) for p2.<runId>.leak.example.com -> NOERROR NODATA (RCODE=0, AA=1, ANCOUNT=0) + observation extracted
+  const validAAAAQuery = encodeDnsQueryPacket({
+    qname: `p2.${validRunId}.${allowedDomain}`,
+    qtype: 28,
+  });
+  const resAAAA = evaluateDnsQueryPacket(validAAAAQuery, allowedDomain);
+  assert.equal(resAAAA.ignore, false);
+  assert.equal(resAAAA.rcode, 0);
+  assert.equal(resAAAA.responseBuffer.readUInt16BE(6), 0); // ANCOUNT=0 (NODATA)
+  assert.ok(resAAAA.observation);
+  assert.equal(resAAAA.observation.runId, validRunId);
+  assert.equal(resAAAA.observation.probeNumber, 2);
+
+  // 3. Incoming packet with QR=1 (already a response) -> ignored to prevent UDP reflection loops
+  const qr1Packet = encodeDnsQueryPacket({
+    flags: 0x8180, // QR=1
+    qname: `p1.${validRunId}.${allowedDomain}`,
+    qtype: 1,
+  });
+  const resQr1 = evaluateDnsQueryPacket(qr1Packet, allowedDomain);
+  assert.equal(resQr1.ignore, true);
+  assert.equal(resQr1.responseBuffer, null);
+  assert.equal(resQr1.observation, null);
+
+  // 4. Out-of-domain query (e.g. google.com) -> REFUSED (RCODE=5, AA=0) and NO observation recorded
+  const outOfZoneQuery = encodeDnsQueryPacket({
+    qname: 'www.example.org',
+    qtype: 1,
+  });
+  const resRefused = evaluateDnsQueryPacket(outOfZoneQuery, allowedDomain);
+  assert.equal(resRefused.ignore, false);
+  assert.equal(resRefused.rcode, 5); // REFUSED
+  assert.equal((resRefused.responseBuffer.readUInt16BE(2) & 0x0400) !== 0, false); // AA=0
+  assert.equal(resRefused.observation, null);
+
+  // 5. In-domain query that does NOT match p<N>.<runId>.<domain> -> NXDOMAIN (RCODE=3, AA=1) and NO observation recorded
+  const invalidSubdomainQuery = encodeDnsQueryPacket({
+    qname: `unknown-host.${allowedDomain}`,
+    qtype: 1,
+  });
+  const resNx = evaluateDnsQueryPacket(invalidSubdomainQuery, allowedDomain);
+  assert.equal(resNx.ignore, false);
+  assert.equal(resNx.rcode, 3); // NXDOMAIN
+  assert.equal((resNx.responseBuffer.readUInt16BE(2) & 0x0400) !== 0, true); // AA=1
+  assert.equal(resNx.observation, null);
+
+  // 6. Unsupported QTYPE (e.g. AXFR=252) or QCLASS (e.g. CH=3) -> NOTIMP (RCODE=4) and NO observation recorded
+  const axfrQuery = encodeDnsQueryPacket({
+    qname: `p1.${validRunId}.${allowedDomain}`,
+    qtype: 252,
+  });
+  const resNotImp = evaluateDnsQueryPacket(axfrQuery, allowedDomain);
+  assert.equal(resNotImp.ignore, false);
+  assert.equal(resNotImp.rcode, 4); // NOTIMP
+  assert.equal(resNotImp.observation, null);
+
+  // 7. Malformed DNS query packet (truncated question) -> FORMERR (RCODE=1)
+  const malformedBuf = Buffer.alloc(14);
+  malformedBuf.writeUInt16BE(0x9999, 0);
+  malformedBuf.writeUInt16BE(0x0100, 2);
+  malformedBuf.writeUInt16BE(1, 4); // QDCOUNT=1, but question is truncated
+  malformedBuf[12] = 10; // Label length 10 exceeding buffer length
+  const resFormErr = evaluateDnsQueryPacket(malformedBuf, allowedDomain);
+  assert.equal(resFormErr.ignore, false);
+  assert.equal(resFormErr.rcode, 1); // FORMERR
+  assert.equal(resFormErr.observation, null);
+});
 

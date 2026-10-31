@@ -25,7 +25,8 @@ import {
   evaluateVpnHeuristic,
   calculateHttpPingMetrics,
   evaluatePortLeakResult,
-  evaluateObservedIpSources
+  evaluateObservedIpSources,
+  buildDnsLeakProbeQname
 } from '../utils/networkEvaluator';
 
 /**
@@ -462,7 +463,8 @@ export async function fetchIpDetails(signal?: AbortSignal): Promise<IpDetails> {
 /**
  * 2A. Independent Zero-Cost Browser DNS & Edge Trace Observation
  * Queries public endpoints (edns.ip-api.com & 1.1.1.1/cdn-cgi/trace) directly from the browser.
- * Never fabricates any resolver on failure, and is strictly separated from Authoritative DNS Leak testing.
+ * Note: HTTP URL query parameters do NOT force DNS cache bypass; this auxiliary check is strictly
+ * informational (status is always INCONCLUSIVE or WARNING) and is never used as proof of PASS for Authoritative DNS.
  */
 async function probeIndependentBrowserDnsObservation(
   ipDetails: IpDetails | null,
@@ -473,7 +475,7 @@ async function probeIndependentBrowserDnsObservation(
   await Promise.allSettled([
     (async () => {
       const t0 = performance.now();
-      const resp = await fetch(`https://edns.ip-api.com/json?nocache=${Date.now()}`, {
+      const resp = await fetch('https://edns.ip-api.com/json', {
         cache: 'no-store',
         signal: createBoundedSignal(4000, signal),
       });
@@ -532,7 +534,8 @@ async function probeIndependentBrowserDnsObservation(
 
 /**
  * 2. Perform Authoritative DNS Leak Test + Independent Zero-Cost Browser DNS Comparison
- * Uses unique cryptographic per-run token and bounded collector polling. Never returns fake resolvers or random latencies.
+ * Uses unique cryptographic per-run token and canonical QNAME labels (`p<N>.<runId>.<domain>`).
+ * Never treats HTTP URL query parameters (`?nocache=...`) as DNS freshness evidence, and never returns fake resolvers.
  */
 export async function performDnsLeakTest(
   ipDetails: IpDetails | null,
@@ -558,7 +561,7 @@ export async function performDnsLeakTest(
         runId,
         authoritativeConfigured: Boolean(errBody?.authoritativeConfigured),
         missingEnvVars: Array.isArray(errBody?.missingEnvVars) ? errBody.missingEnvVars : undefined,
-        resolvers: [],
+         resolvers: [],
         ipDetails,
         independentBrowserObservation,
         startedAt,
@@ -572,11 +575,30 @@ export async function performDnsLeakTest(
     const missingEnvVars = Array.isArray(json.missingEnvVars) ? json.missingEnvVars : undefined;
     const dnsLeakDomain = json.dnsLeakDomain as string | null;
 
-    // If an authoritative DNS domain IS configured, trigger 3 unique cache-bypassing subqueries from the browser
+    // If an authoritative DNS domain IS configured, trigger 3 unique subdomain lookups using canonical `p<N>.<runId>.<domain>` QNAMEs.
+    // Note: DNS cache bypass relies strictly on the unique per-run hostname labels (`p1.<runId>.<domain>`), NOT on HTTP path/query parameters.
+    // Sending these browser requests only initiates hostname resolution; if no verified UDP/53 evidence is collected, status remains INCONCLUSIVE.
     if (authoritativeConfigured && dnsLeakDomain) {
-      const probeUrls = [1, 2, 3].map(
-        i => `https://p${i}-${runId}.${dnsLeakDomain}/?nocache=${Date.now()}_${i}`
-      );
+      const probeQnames = [1, 2, 3]
+        .map(i => buildDnsLeakProbeQname(i, runId, dnsLeakDomain))
+        .filter((q): q is string => q !== null);
+
+      if (probeQnames.length === 0) {
+        return evaluateDnsTestResult({
+          runId,
+          authoritativeConfigured: true,
+          dnsLeakDomain,
+          missingEnvVars: [],
+          resolvers: [],
+          ipDetails,
+          independentBrowserObservation,
+          startedAt,
+          completedAt: new Date().toISOString(),
+          errorMessage: 'دامنهٔ تست DNS یا شناسهٔ اجرا با قالب استاندارد برچسب‌های RFC 1035 سازگار نیست.',
+        });
+      }
+
+      const probeUrls = probeQnames.map(qname => `https://${qname}/`);
       await Promise.allSettled(
         probeUrls.map(u =>
           fetch(u, { mode: 'no-cors', cache: 'no-store', signal: createBoundedSignal(2500, signal) })
@@ -607,6 +629,7 @@ export async function performDnsLeakTest(
       return evaluateDnsTestResult({
         runId,
         authoritativeConfigured: true,
+        dnsLeakDomain,
         missingEnvVars: [],
         resolvers: capturedResolvers,
         ipDetails,
@@ -619,6 +642,7 @@ export async function performDnsLeakTest(
     return evaluateDnsTestResult({
       runId,
       authoritativeConfigured,
+      dnsLeakDomain,
       missingEnvVars,
       resolvers: Array.isArray(json.resolvers) ? json.resolvers : [],
       ipDetails,
