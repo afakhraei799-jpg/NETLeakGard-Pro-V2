@@ -649,6 +649,10 @@ export async function performDnsLeakTest(
       independentBrowserObservation,
       startedAt,
       completedAt: new Date().toISOString(),
+      errorMessage:
+        json.configState === 'partial_or_invalid' && typeof json.messageFa === 'string'
+          ? json.messageFa
+          : undefined,
     });
   } catch (e: any) {
     const independentBrowserObservation = await independentPromise.catch(() =>

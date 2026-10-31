@@ -338,6 +338,17 @@ function forwardObservationToWorker(payload) {
   }
 }
 
+export function isUdp53ResponderConfigured(env = process.env) {
+  const domain = String(env?.DNS_LEAK_DOMAIN || '').trim().toLowerCase().replace(/^\.+|\.+$/g, '');
+  const ingestUrl = String(env?.WORKER_INGEST_URL || '').trim();
+  const token = String(env?.DNS_COLLECTOR_API_TOKEN || '').trim();
+  const configured = Boolean(domain && ingestUrl && token && isValidBaseDomain(domain));
+  return {
+    configured,
+    domain: configured ? domain : null,
+  };
+}
+
 const isMainModule =
   typeof process !== 'undefined' &&
   Array.isArray(process.argv) &&
@@ -345,11 +356,11 @@ const isMainModule =
   path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 
 if (isMainModule) {
-  if (!DNS_LEAK_DOMAIN || !WORKER_INGEST_URL || !DNS_COLLECTOR_API_TOKEN) {
-    console.error(
-      '[Authoritative-UDP53] خطا: متغیرهای محیطی DNS_LEAK_DOMAIN، WORKER_INGEST_URL و DNS_COLLECTOR_API_TOKEN باید تنظیم شوند.'
+  if (!DNS_LEAK_DOMAIN || !WORKER_INGEST_URL || !DNS_COLLECTOR_API_TOKEN || !isValidBaseDomain(DNS_LEAK_DOMAIN)) {
+    console.log(
+      '[Authoritative-UDP53] وضعیت: پیکربندی نشده (غیرفعال) — متغیرهای اختیاری شنوندهٔ UDP/53 تنظیم نشده‌اند؛ سرویس بدون خطا متوقف شد.'
     );
-    process.exit(1);
+    process.exit(0);
   }
 
   const server = dgram.createSocket('udp4');

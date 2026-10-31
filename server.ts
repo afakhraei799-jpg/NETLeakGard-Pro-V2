@@ -12,6 +12,7 @@ import dotenv from 'dotenv';
 import {
   COMMON_SENSITIVE_PORTS,
   canonicalizeIp,
+  evaluateOptionalDnsServerConfig,
   formatTestStatusLabelFa,
   isGloballyRoutablePublicIp,
   isPrivateOrLocalAddress,
@@ -123,7 +124,8 @@ function extractVerifiedClientIpInfo(req: express.Request): {
   canScanForwardedIp: boolean;
 } {
   const rawSocketIp = normalizeIp(req.socket.remoteAddress);
-  const trustProxyEnv = process.env.TRUST_PROXY === 'true';
+  const rawTrustProxy = (process.env.TRUST_PROXY || '').trim().toLowerCase();
+  const trustProxyEnv = rawTrustProxy === 'true' || rawTrustProxy === '1';
   const socketIsLocalProxy = !rawSocketIp || isPrivateOrLocalAddress(rawSocketIp);
   const proxyHeaderTrusted = trustProxyEnv && socketIsLocalProxy;
 
@@ -700,22 +702,16 @@ app.get('/api/ip-info', rateLimit(30, 60_000, 'ip-info'), async (req, res) => {
 
 // 1.5 Endpoint: Configuration & Health Check (Zero secret exposure, never crashes on missing optional keys)
 app.get('/api/health', (_req, res) => {
-  const dnsLeakDomain = (process.env.DNS_LEAK_DOMAIN || '').trim().toLowerCase().replace(/^\.+|\.+$/g, '');
-  const collectorApiUrl = (process.env.DNS_COLLECTOR_API_URL || '').trim();
-  const collectorToken = (process.env.DNS_COLLECTOR_API_TOKEN || '').trim();
-  const udp53Verified = (process.env.DNS_UDP53_VERIFIED || '').trim().toLowerCase() === 'true';
-  const missingDnsEnvVars: string[] = [];
-  if (!dnsLeakDomain || !isValidDnsLeakBaseDomain(dnsLeakDomain)) missingDnsEnvVars.push('DNS_LEAK_DOMAIN');
-  if (!collectorApiUrl) missingDnsEnvVars.push('DNS_COLLECTOR_API_URL');
-  if (!collectorToken) missingDnsEnvVars.push('DNS_COLLECTOR_API_TOKEN');
-  if (!udp53Verified) missingDnsEnvVars.push('DNS_UDP53_VERIFIED=true');
+  const dnsConfig = evaluateOptionalDnsServerConfig(process.env);
 
   res.json({
     ok: true,
     timestamp: new Date().toISOString(),
     optionalIntegrations: {
-      authoritativeDnsConfigured: missingDnsEnvVars.length === 0,
-      missingDnsEnvVars,
+      authoritativeDnsConfigured: dnsConfig.authoritativeConfigured,
+      dnsConfigState: dnsConfig.configState,
+      missingDnsEnvVars: dnsConfig.missingEnvVars,
+      dnsConfigIssuesFa: dnsConfig.configIssuesFa,
       abuseIpDbConfigured: Boolean((process.env.ABUSEIPDB_API_KEY || '').trim()),
       googleSafeBrowsingConfigured: Boolean((process.env.GOOGLE_SAFE_BROWSING_API_KEY || '').trim()),
       geminiConfigured: Boolean(getGeminiClient()),
@@ -731,23 +727,14 @@ app.get('/api/dns-leak-probe', rateLimit(30, 60_000, 'dns-leak-probe'), async (r
       ? req.query.runId
       : crypto.randomUUID();
 
-  const dnsLeakDomain = (process.env.DNS_LEAK_DOMAIN || '').trim().toLowerCase().replace(/^\.+|\.+$/g, '');
-  const collectorApiUrl = (process.env.DNS_COLLECTOR_API_URL || '').trim();
-  const collectorToken = (process.env.DNS_COLLECTOR_API_TOKEN || '').trim();
-  const udp53Verified = (process.env.DNS_UDP53_VERIFIED || '').trim().toLowerCase() === 'true';
-
-  const missingEnvVars: string[] = [];
-  if (!dnsLeakDomain || !isValidDnsLeakBaseDomain(dnsLeakDomain)) missingEnvVars.push('DNS_LEAK_DOMAIN');
-  if (!collectorApiUrl) missingEnvVars.push('DNS_COLLECTOR_API_URL');
-  if (!collectorToken) missingEnvVars.push('DNS_COLLECTOR_API_TOKEN');
-  if (!udp53Verified) missingEnvVars.push('DNS_UDP53_VERIFIED=true');
-
-  const authoritativeConfigured = missingEnvVars.length === 0;
+  const dnsConfig = evaluateOptionalDnsServerConfig(process.env);
+  const { authoritativeConfigured, dnsLeakDomain, collectorUrl, collectorToken, missingEnvVars, configState, configIssuesFa } =
+    dnsConfig;
 
   try {
-    if (!authoritativeConfigured) {
+    if (!authoritativeConfigured || !dnsLeakDomain || !collectorUrl || !collectorToken) {
       // Do NOT return fake Cloudflare/Google/Quad9/OpenDNS resolvers or Math.random() latencies!
-      // Report server OS configured resolvers strictly as server-side metadata, and mark authoritativeConfigured: false.
+      // Empty or partial/invalid optional variables gracefully disable ONLY Authoritative DNS with HTTP 200.
       const serverSystemDns = dns.getServers();
       return res.json({
         success: true,
@@ -755,40 +742,39 @@ app.get('/api/dns-leak-probe', rateLimit(30, 60_000, 'dns-leak-probe'), async (r
         startedAt,
         completedAt: new Date().toISOString(),
         authoritativeConfigured: false,
+        configState,
         missingEnvVars,
+        configIssuesFa,
         dnsLeakDomain: null,
         serverSystemResolvers: serverSystemDns,
         resolvers: [],
-        messageFa:
-          `وضعیت: پیکربندی نشده — متغیرهای محیطی (${missingEnvVars.join('، ')}) تنظیم یا تأیید نشده‌اند. بدون سرور Authoritative DNS اختصاصی و تأیید عملی UDP/53، هیچ نتیجه‌ای به عنوان موفق یا امن جعل نمی‌شود.`,
+        messageFa: dnsConfig.messageFa,
       });
     }
 
-    // When DNS_LEAK_DOMAIN, DNS_COLLECTOR_API_URL, and DNS_COLLECTOR_API_TOKEN are all configured:
-    // Validate collectorApiUrl against SSRF & private/loopback targets
-    const urlCheck = isSafeExternalUrl(collectorApiUrl);
-    if (!urlCheck.valid || !urlCheck.url) {
-      return res.status(400).json({
-        success: false,
-        runId,
-        authoritativeConfigured: true,
-        errorCode: 'UNSAFE_COLLECTOR_URL',
-        error: `آدرس سرویس ثبت‌کنندهٔ DNS نامعتبر یا ناامن است: ${urlCheck.reason || 'Invalid URL'}`,
-      });
-    }
-
-    const url = urlCheck.url;
+    const url = new URL(collectorUrl.toString());
     url.searchParams.set('runId', runId);
 
     // Also verify DNS resolution of collector host and execute anti-DNS-rebinding request
     const dnsHostCheck = await resolveAndValidatePublicHost(url.hostname);
     if (!dnsHostCheck.ok) {
-      return res.status(400).json({
-        success: false,
+      // Non-blocking fallback: if the optional collector host cannot be resolved or points to a private IP,
+      // disable only Authoritative DNS with HTTP 200 so the rest of the application and independent browser tests continue.
+      const issueFa = `میزبان سرویس ثبت‌کنندهٔ اختیاری DNS (${url.hostname}) قابل مسیریابی عمومی نیست (${dnsHostCheck.reason}).`;
+      return res.json({
+        success: true,
         runId,
-        authoritativeConfigured: true,
+        startedAt,
+        completedAt: new Date().toISOString(),
+        authoritativeConfigured: false,
+        configState: 'partial_or_invalid',
+        missingEnvVars: ['DNS_COLLECTOR_API_URL'],
+        configIssuesFa: [...configIssuesFa, issueFa],
+        dnsLeakDomain: null,
+        serverSystemResolvers: dns.getServers(),
+        resolvers: [],
         errorCode: 'UNSAFE_COLLECTOR_DNS_RESOLUTION',
-        error: `خطای امنیتی در بررسی DNS سرویس ثبت‌کننده: ${dnsHostCheck.reason}`,
+        messageFa: `وضعیت: پیکربندی نشده — ${issueFa} فقط تست Authoritative DNS غیرفعال شد.`,
       });
     }
 
@@ -1036,7 +1022,7 @@ function buildRuleBasedAuditReport(networkData: any, fallbackSummaryFa: string) 
     ],
     threatsFoundFa: [],
     recommendationsFa: [
-      'برای اجرای تست کامل Authoritative DNS، متغیرهای DNS_LEAK_DOMAIN، DNS_COLLECTOR_API_URL و DNS_COLLECTOR_API_TOKEN را در سرور پیکربندی کنید.',
+      'در حالت بدون زیرساخت Authoritative DNS، نتایج بررسی مستقل مرورگر، آدرس IP عمومی و WebRTC را مبنای تحلیل قرار دهید.',
       'توجه داشته باشید که تست‌های داخل مرورگر، وضعیت تمام ترافیک سطح سیستم‌عامل را اثبات نمی‌کنند.'
     ],
     aiAvailable: false,

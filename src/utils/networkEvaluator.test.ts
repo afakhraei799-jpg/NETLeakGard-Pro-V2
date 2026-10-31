@@ -14,6 +14,7 @@ import {
   parseIceCandidateLine,
   evaluateWebRtcCandidates,
   evaluateDnsTestResult,
+  evaluateOptionalDnsServerConfig,
   evaluateIndependentBrowserDnsObservation,
   evaluateVpnHeuristic,
   calculateHttpPingMetrics,
@@ -36,7 +37,7 @@ import {
 } from '../components/Globe3D';
 import cloudflareWorker, { type Env as CloudflareEnv } from '../../cloudflare/worker';
 // @ts-ignore
-import { extractRunIdFromQname, parseDnsLeakQname, evaluateDnsQueryPacket } from '../../cloudflare/authoritative-dns-udp53.mjs';
+import { extractRunIdFromQname, parseDnsLeakQname, evaluateDnsQueryPacket, isUdp53ResponderConfigured } from '../../cloudflare/authoritative-dns-udp53.mjs';
 
 test('IP validation and RFC1918/mDNS private address classification', () => {
   assert.equal(isValidIpv4('1.1.1.1'), true);
@@ -2240,4 +2241,193 @@ test('Authoritative UDP/53 DNS packet responder enforces RFC 1035 QR=1 ignore, F
   assert.equal(resFormErr.rcode, 1); // FORMERR
   assert.equal(resFormErr.observation, null);
 });
+
+test('Zero-config execution: application runs with all environment variables empty without demanding variables, keeps Authoritative DNS as NOT_CONFIGURED, and executes independent tests', async () => {
+  const nowIso = new Date().toISOString();
+
+  // 1. Server DNS config evaluation with completely empty environment `{}`
+  const emptyServerConfig = evaluateOptionalDnsServerConfig({});
+  assert.equal(emptyServerConfig.authoritativeConfigured, false);
+  assert.equal(emptyServerConfig.configState, 'unconfigured');
+  assert.deepEqual(emptyServerConfig.missingEnvVars, []); // No variable is flagged as a mandatory missing requirement
+  assert.deepEqual(emptyServerConfig.configIssuesFa, []);
+  assert.equal(emptyServerConfig.dnsLeakDomain, null);
+  assert.equal(emptyServerConfig.collectorUrl, null);
+  assert.equal(emptyServerConfig.collectorToken, null);
+  assert.equal(emptyServerConfig.udp53Verified, false);
+  assert.equal(emptyServerConfig.trustProxyEnabled, false);
+
+  // 2. UDP/53 responder configuration check with empty environment `{}`
+  const emptyUdpConfig = isUdp53ResponderConfigured({});
+  assert.equal(emptyUdpConfig.configured, false);
+  assert.equal(emptyUdpConfig.domain, null);
+
+  // 3. Cloudflare Worker with completely empty environment `{}`
+  const emptyWorkerEnv: CloudflareEnv = {};
+  const workerHealthRes = await cloudflareWorker.fetch(
+    new Request('https://example.workers.dev/api/health'),
+    emptyWorkerEnv
+  );
+  assert.equal(workerHealthRes.status, 200);
+  const workerHealthJson: any = await workerHealthRes.json();
+  assert.equal(workerHealthJson.ok, true);
+  assert.equal(workerHealthJson.optionalIntegrations.authoritativeDnsConfigured, false);
+  assert.equal(workerHealthJson.optionalIntegrations.dnsConfigState, 'unconfigured');
+  assert.deepEqual(workerHealthJson.optionalIntegrations.missingDnsEnvVars, []);
+
+  const workerDnsProbeRes = await cloudflareWorker.fetch(
+    new Request('https://example.workers.dev/api/dns-leak-probe'),
+    emptyWorkerEnv
+  );
+  assert.equal(workerDnsProbeRes.status, 200);
+  const workerDnsProbeJson: any = await workerDnsProbeRes.json();
+  assert.equal(workerDnsProbeJson.success, true);
+  assert.equal(workerDnsProbeJson.authoritativeConfigured, false);
+  assert.equal(workerDnsProbeJson.configState, 'unconfigured');
+  assert.deepEqual(workerDnsProbeJson.missingEnvVars, []);
+  assert.deepEqual(workerDnsProbeJson.resolvers, []);
+
+  // 4. Independent tests (IP, Browser DNS, WebRTC, HTTP Ping) run cleanly while Authoritative DNS stays NOT_CONFIGURED (never PASS)
+  const mockIpDetails: any = {
+    status: 'PASS',
+    ip: '198.51.100.10',
+    countryCode: 'DE',
+    countryName: 'Germany',
+    asn: 'AS24940',
+    isp: 'Hetzner Online GmbH',
+    ipMismatchDetected: false,
+    isDatacenter: true,
+    fraudRiskScore: null,
+  };
+
+  const browserDnsObs = evaluateIndependentBrowserDnsObservation(
+    [
+      {
+        sourceName: 'Cloudflare Edge Trace (FRA)',
+        observedIp: '198.51.100.10',
+        locationOrGeo: 'DE',
+        role: 'edge_trace_egress',
+        responseTimeMs: 24,
+      },
+    ],
+    mockIpDetails
+  );
+  assert.equal(browserDnsObs.status, 'INCONCLUSIVE');
+  assert.equal(browserDnsObs.matchesPrimaryEgressIp, true);
+
+  const dnsResult = evaluateDnsTestResult({
+    runId: workerDnsProbeJson.runId,
+    authoritativeConfigured: workerDnsProbeJson.authoritativeConfigured,
+    missingEnvVars: workerDnsProbeJson.missingEnvVars,
+    resolvers: workerDnsProbeJson.resolvers,
+    ipDetails: mockIpDetails,
+    independentBrowserObservation: browserDnsObs,
+    startedAt: nowIso,
+    completedAt: nowIso,
+  });
+  assert.equal(dnsResult.status, 'NOT_CONFIGURED');
+  assert.notEqual(dnsResult.status, 'PASS');
+  assert.equal(dnsResult.isLeaking, null);
+  assert.deepEqual(dnsResult.missingEnvVars, []);
+  assert.equal(dnsResult.independentBrowserObservation?.matchesPrimaryEgressIp, true);
+
+  const webRtcPass = evaluateWebRtcCandidates({
+    isSupported: true,
+    candidates: [
+      {
+        ip: '198.51.100.10',
+        version: 'IPv4',
+        type: 'srflx',
+        protocol: 'UDP',
+        port: 52000,
+        isLocalLanIp: false,
+        isPublicIp: true,
+      },
+    ],
+    referencePublicIps: ['198.51.100.10'],
+    stunServersUsed: ['stun:stun.l.google.com:19302'],
+    startedAt: nowIso,
+    completedAt: nowIso,
+  });
+  assert.equal(webRtcPass.status, 'PASS');
+
+  const summary = evaluateOverallSummary({
+    ipDetails: mockIpDetails,
+    dnsLeak: dnsResult,
+    webRtcLeak: webRtcPass,
+    vpnProxy: evaluateVpnHeuristic(mockIpDetails, dnsResult),
+  });
+  // Overall summary must never claim PASS or 100 when Authoritative DNS is NOT_CONFIGURED
+  assert.equal(summary.overallStatus, 'INCONCLUSIVE');
+  assert.equal(summary.isScoreCalculable, false);
+  assert.equal(summary.privacyScore, null);
+});
+
+test('Partial or invalid environment variable values degrade gracefully to NOT_CONFIGURED without crashing or returning blocking HTTP errors', async () => {
+  const nowIso = new Date().toISOString();
+
+  // Case 1: Invalid DNS_LEAK_DOMAIN syntax + loopback/unsafe DNS_COLLECTOR_API_URL + missing token + invalid TRUST_PROXY
+  const invalidServerEnv = {
+    DNS_LEAK_DOMAIN: 'invalid..domain..local',
+    DNS_COLLECTOR_API_URL: 'http://127.0.0.1:8080/internal-admin',
+    DNS_COLLECTOR_API_TOKEN: '',
+    DNS_UDP53_VERIFIED: 'maybe',
+    TRUST_PROXY: 'not-a-boolean',
+  };
+
+  const evalInvalid = evaluateOptionalDnsServerConfig(invalidServerEnv);
+  assert.equal(evalInvalid.authoritativeConfigured, false);
+  assert.equal(evalInvalid.configState, 'partial_or_invalid');
+  assert.equal(evalInvalid.trustProxyEnabled, false); // Safely defaults to false
+  assert.equal(evalInvalid.udp53Verified, false); // Safely defaults to false
+  assert.ok(evalInvalid.missingEnvVars.includes('DNS_LEAK_DOMAIN'));
+  assert.ok(evalInvalid.missingEnvVars.includes('DNS_COLLECTOR_API_URL'));
+  assert.ok(evalInvalid.missingEnvVars.includes('DNS_COLLECTOR_API_TOKEN'));
+  assert.ok(evalInvalid.missingEnvVars.includes('DNS_UDP53_VERIFIED=true'));
+  assert.ok(evalInvalid.configIssuesFa.length >= 4);
+
+  // Evaluating DNS result with partial/invalid config keeps status NOT_CONFIGURED (never ERROR or PASS)
+  const partialDnsRes = evaluateDnsTestResult({
+    runId: crypto.randomUUID(),
+    authoritativeConfigured: evalInvalid.authoritativeConfigured,
+    missingEnvVars: evalInvalid.missingEnvVars,
+    resolvers: [],
+    ipDetails: null,
+    startedAt: nowIso,
+    completedAt: nowIso,
+    errorMessage: evalInvalid.messageFa,
+  });
+  assert.equal(partialDnsRes.status, 'NOT_CONFIGURED');
+  assert.equal(partialDnsRes.isLeaking, null);
+  assert.ok(partialDnsRes.messageFa.includes('ناقص یا نامعتبر'));
+
+  // Case 2: Only DNS_LEAK_DOMAIN set, collector URL and token omitted
+  const partialOnlyDomain = evaluateOptionalDnsServerConfig({
+    DNS_LEAK_DOMAIN: 'leak.example.com',
+  });
+  assert.equal(partialOnlyDomain.authoritativeConfigured, false);
+  assert.equal(partialOnlyDomain.configState, 'partial_or_invalid');
+  assert.equal(partialOnlyDomain.missingEnvVars.includes('DNS_LEAK_DOMAIN'), false);
+  assert.equal(partialOnlyDomain.missingEnvVars.includes('DNS_COLLECTOR_API_URL'), true);
+  assert.equal(partialOnlyDomain.missingEnvVars.includes('DNS_COLLECTOR_API_TOKEN'), true);
+
+  // Case 3: Cloudflare Worker with partial/invalid DNS_LEAK_DOMAIN returns HTTP 200 (never 400/500) on /api/dns-leak-probe
+  const partialWorkerEnv: CloudflareEnv = {
+    DNS_LEAK_DOMAIN: 'bad..domain',
+    DNS_COLLECTOR_API_TOKEN: '',
+    DNS_UDP53_VERIFIED: 'invalid-flag',
+  };
+  const probeRes = await cloudflareWorker.fetch(
+    new Request('https://example.workers.dev/api/dns-leak-probe'),
+    partialWorkerEnv
+  );
+  assert.equal(probeRes.status, 200);
+  const probeJson: any = await probeRes.json();
+  assert.equal(probeJson.success, true);
+  assert.equal(probeJson.authoritativeConfigured, false);
+  assert.equal(probeJson.configState, 'partial_or_invalid');
+  assert.ok(Array.isArray(probeJson.configIssuesFa) && probeJson.configIssuesFa.length > 0);
+  assert.deepEqual(probeJson.resolvers, []);
+});
+
 

@@ -1230,6 +1230,140 @@ export function isValidDnsObservationRecord(
   return true;
 }
 
+export interface OptionalDnsServerConfigEvaluation {
+  authoritativeConfigured: boolean;
+  configState: 'unconfigured' | 'partial_or_invalid' | 'configured';
+  dnsLeakDomain: string | null;
+  collectorUrl: URL | null;
+  collectorToken: string | null;
+  udp53Verified: boolean;
+  trustProxyEnabled: boolean;
+  missingEnvVars: string[];
+  configIssuesFa: string[];
+  messageFa: string;
+}
+
+/**
+ * Evaluates optional server environment variables (DNS_LEAK_DOMAIN, DNS_COLLECTOR_API_URL,
+ * DNS_COLLECTOR_API_TOKEN, DNS_UDP53_VERIFIED, TRUST_PROXY) without requiring any variable
+ * to be set and without generating synthetic defaults.
+ * - Completely empty values are treated as a clean, valid 'unconfigured' state (missingEnvVars = []).
+ * - Partial or invalid values disable ONLY the Authoritative DNS feature (authoritativeConfigured = false,
+ *   configState = 'partial_or_invalid') and record non-blocking diagnostic issues without halting execution.
+ */
+export function evaluateOptionalDnsServerConfig(
+  env: Record<string, string | undefined> = {}
+): OptionalDnsServerConfigEvaluation {
+  const rawDomain = (env.DNS_LEAK_DOMAIN || '').trim().toLowerCase().replace(/^\.+|\.+$/g, '');
+  const rawUrl = (env.DNS_COLLECTOR_API_URL || '').trim();
+  const rawToken = (env.DNS_COLLECTOR_API_TOKEN || '').trim();
+  const rawUdp53 = (env.DNS_UDP53_VERIFIED || '').trim().toLowerCase();
+  const rawTrustProxy = (env.TRUST_PROXY || '').trim().toLowerCase();
+
+  const udp53Verified = rawUdp53 === 'true';
+  const trustProxyEnabled = rawTrustProxy === 'true' || rawTrustProxy === '1';
+
+  const configIssuesFa: string[] = [];
+
+  if (rawTrustProxy && !['true', 'false', '1', '0'].includes(rawTrustProxy)) {
+    configIssuesFa.push(
+      'مقدار متغیر اختیاری TRUST_PROXY نامعتبر است (مقادیر مجاز: true یا false)؛ حالت ایمن پیش‌فرض (false) اعمال شد.'
+    );
+  }
+
+  if (rawUdp53 && !['true', 'false', '1', '0'].includes(rawUdp53)) {
+    configIssuesFa.push(
+      'مقدار متغیر اختیاری DNS_UDP53_VERIFIED نامعتبر است؛ تا زمان تنظیم صریح برابر true، شنوندهٔ UDP/53 تأییدنشده تلقی می‌شود.'
+    );
+  }
+
+  const anyDnsVarProvided = Boolean(rawDomain || rawUrl || rawToken || udp53Verified);
+
+  if (!anyDnsVarProvided) {
+    return {
+      authoritativeConfigured: false,
+      configState: configIssuesFa.length > 0 ? 'partial_or_invalid' : 'unconfigured',
+      dnsLeakDomain: null,
+      collectorUrl: null,
+      collectorToken: null,
+      udp53Verified: false,
+      trustProxyEnabled,
+      missingEnvVars: [],
+      configIssuesFa,
+      messageFa:
+        'وضعیت: پیکربندی نشده — زیرساخت اختیاری Authoritative DNS تنظیم نشده است. بررسی مستقل DNS مرورگر و سایر تست‌های شبکه بدون نیاز به متغیر محیطی اجرا می‌شوند و هیچ نتیجه‌ای به‌عنوان امن یا موفق جعل نمی‌شود.',
+    };
+  }
+
+  // At least one optional DNS variable was provided; validate completeness and syntax non-blockingly
+  const missingEnvVars: string[] = [];
+  let validDomain: string | null = null;
+  let validUrl: URL | null = null;
+
+  if (!rawDomain) {
+    missingEnvVars.push('DNS_LEAK_DOMAIN');
+    configIssuesFa.push('متغیر DNS_LEAK_DOMAIN خالی است.');
+  } else if (!isValidDnsLeakBaseDomain(rawDomain)) {
+    missingEnvVars.push('DNS_LEAK_DOMAIN');
+    configIssuesFa.push('قالب دامنهٔ DNS_LEAK_DOMAIN نامعتبر است (باید یک دامنهٔ عمومی معتبر مطابق RFC 1035 باشد).');
+  } else {
+    validDomain = rawDomain;
+  }
+
+  if (!rawUrl) {
+    missingEnvVars.push('DNS_COLLECTOR_API_URL');
+    configIssuesFa.push('متغیر DNS_COLLECTOR_API_URL خالی است.');
+  } else {
+    const urlCheck = isSafeExternalUrl(rawUrl);
+    if (!urlCheck.valid || !urlCheck.url) {
+      missingEnvVars.push('DNS_COLLECTOR_API_URL');
+      configIssuesFa.push(
+        `آدرس DNS_COLLECTOR_API_URL نامعتبر یا ناامن است (${urlCheck.reason || 'Invalid URL'}).`
+      );
+    } else {
+      validUrl = urlCheck.url;
+    }
+  }
+
+  if (!rawToken) {
+    missingEnvVars.push('DNS_COLLECTOR_API_TOKEN');
+    configIssuesFa.push('توکن احراز هویت DNS_COLLECTOR_API_TOKEN خالی است.');
+  }
+
+  if (!udp53Verified) {
+    missingEnvVars.push('DNS_UDP53_VERIFIED=true');
+    configIssuesFa.push('تأیید عملی شنوندهٔ UDP/53 (DNS_UDP53_VERIFIED=true) فعال نشده است.');
+  }
+
+  if (missingEnvVars.length > 0 || !validDomain || !validUrl || !rawToken || !udp53Verified) {
+    return {
+      authoritativeConfigured: false,
+      configState: 'partial_or_invalid',
+      dnsLeakDomain: null,
+      collectorUrl: null,
+      collectorToken: null,
+      udp53Verified,
+      trustProxyEnabled,
+      missingEnvVars,
+      configIssuesFa,
+      messageFa: `وضعیت: پیکربندی نشده (تنظیمات اختیاری ناقص یا نامعتبر) — ${configIssuesFa.join(' ')} فقط تست Authoritative DNS غیرفعال شد و سایر بخش‌های برنامه بدون توقف کار می‌کنند.`,
+    };
+  }
+
+  return {
+    authoritativeConfigured: true,
+    configState: 'configured',
+    dnsLeakDomain: validDomain,
+    collectorUrl: validUrl,
+    collectorToken: rawToken,
+    udp53Verified: true,
+    trustProxyEnabled,
+    missingEnvVars: [],
+    configIssuesFa,
+    messageFa: 'زیرساخت Authoritative DNS پیکربندی شده است.',
+  };
+}
+
 /**
  * Evaluates DNS Leak results based on real authoritative logs or explicitly marks NOT_CONFIGURED / INCONCLUSIVE.
  * Never inspects localized status text (like "Leak" or "مغایرت") to decide leak state.
@@ -1250,7 +1384,7 @@ export function evaluateDnsTestResult(params: {
   let {
     runId,
     authoritativeConfigured,
-    missingEnvVars = ['DNS_LEAK_DOMAIN', 'DNS_COLLECTOR_API_URL', 'DNS_COLLECTOR_API_TOKEN'],
+    missingEnvVars = [],
     dnsLeakDomain,
     resolvers,
     ipDetails,
@@ -1270,10 +1404,12 @@ export function evaluateDnsTestResult(params: {
   const normalizedRunId = typeof runId === 'string' ? runId.trim() : '';
 
   if (!authoritativeConfigured) {
-    const missingList =
-      missingEnvVars.length > 0
-        ? missingEnvVars
-        : ['DNS_LEAK_DOMAIN', 'DNS_COLLECTOR_API_URL', 'DNS_COLLECTOR_API_TOKEN'];
+    const missingList = Array.isArray(missingEnvVars) ? missingEnvVars : [];
+    const detailNoteFa = errorMessage
+      ? errorMessage
+      : missingList.length > 0
+        ? `وضعیت: پیکربندی نشده — تنظیمات اختیاری (${missingList.join('، ')}) کامل یا معتبر نیستند.`
+        : 'وضعیت: پیکربندی نشده — زیرساخت اختیاری Authoritative DNS فعال نیست؛ بررسی مستقل DNS مرورگر به‌صورت جداگانه اجرا شد.';
 
     return {
       status: 'NOT_CONFIGURED',
@@ -1281,7 +1417,7 @@ export function evaluateDnsTestResult(params: {
       startedAt,
       completedAt,
       observations: [
-        `وضعیت تست Authoritative DNS: پیکربندی نشده — متغیرهای (${missingList.join('، ')}) تنظیم نشده‌اند.`,
+        detailNoteFa,
         'طبق اصل صداقت فنی، بدون زیرساخت Authoritative DNS اختصاصی، نتیجهٔ این تست هرگز «موفق» یا «امن» اعلام نمی‌شود.',
       ],
       evidence: {
@@ -1290,10 +1426,7 @@ export function evaluateDnsTestResult(params: {
         missingEnvVars: missingList,
         independentBrowserObservation: independentBrowserObservation || null,
       },
-      limitations: [
-        ...dnsLimitations,
-        `برای فعال‌سازی تست Authoritative DNS، تنظیم متغیرهای ${missingList.join('، ')} جهت ثبت کوئری ساب‌دامین یکتای هر اجرا (p1.\${runId}.<DNS_LEAK_DOMAIN>) ضروری است.`
-      ],
+      limitations: dnsLimitations,
       errorCode: 'AUTHORITATIVE_DNS_NOT_CONFIGURED',
       source: 'Authoritative DNS Configuration Check',
       confidence: 'none',
@@ -1304,8 +1437,9 @@ export function evaluateDnsTestResult(params: {
       resolvers: [],
       isLeaking: null,
       independentBrowserObservation,
-      messageFa: `پیکربندی نشده: متغیرهای (${missingList.join('، ')}) تنظیم نشده‌اند. بدون سرور Authoritative DNS اختصاصی، نمی‌توان عدم نشت DNS را تأیید یا رد کرد.`,
-      messageEn: `Not Configured: Environment variables (${missingList.join(', ')}) are not set. Cannot claim DNS safety without an authoritative DNS collector.`,
+      messageFa: `${detailNoteFa} بدون سرور Authoritative DNS اختصاصی، نمی‌توان عدم نشت DNS را تأیید یا رد کرد.`,
+      messageEn:
+        'Not Configured: Optional Authoritative DNS infrastructure is not active. Independent browser DNS observation ran separately; cannot claim OS-level DNS safety without an authoritative collector.',
     };
   }
 

@@ -90,18 +90,6 @@ export const DnsLeakCard: React.FC<DnsLeakCardProps> = ({ dnsLeak, lang }) => {
                   ? 'در انتظار اجرای آزمون...'
                   : 'Awaiting test execution...'}
             </p>
-            {dnsLeak?.status === 'NOT_CONFIGURED' && dnsLeak.missingEnvVars && dnsLeak.missingEnvVars.length > 0 && (
-              <div dir="ltr" className="mt-2 flex flex-wrap gap-1.5">
-                {dnsLeak.missingEnvVars.map(envName => (
-                  <span
-                    key={envName}
-                    className="px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-[10px] font-mono text-amber-300"
-                  >
-                    {envName}: unset
-                  </span>
-                ))}
-              </div>
-            )}
           </div>
         </div>
 

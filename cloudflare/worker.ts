@@ -250,8 +250,11 @@ async function readBoundedJsonBody(
 
 function isAuthoritativeDnsFullyConfigured(env: Env): {
   configured: boolean;
+  configState: 'unconfigured' | 'partial_or_invalid' | 'configured';
   missingVars: string[];
+  configIssuesFa: string[];
   dnsLeakDomain: string | null;
+  messageFa: string;
 } {
   const domain = (env.DNS_LEAK_DOMAIN || '').trim().toLowerCase().replace(/^\.+|\.+$/g, '');
   const token = (
@@ -260,19 +263,71 @@ function isAuthoritativeDnsFullyConfigured(env: Env): {
     env.DNS_COLLECTOR_API_TOKEN_PREVIOUS ||
     ''
   ).trim();
-  const udp53Verified = (env.DNS_UDP53_VERIFIED || '').trim().toLowerCase() === 'true';
+  const rawUdp53 = (env.DNS_UDP53_VERIFIED || '').trim().toLowerCase();
+  const udp53Verified = rawUdp53 === 'true';
   const hasKv = Boolean(env.DNS_LOGS_KV && typeof env.DNS_LOGS_KV.get === 'function');
 
+  const configIssuesFa: string[] = [];
+  if (rawUdp53 && !['true', 'false', '1', '0'].includes(rawUdp53)) {
+    configIssuesFa.push(
+      'مقدار متغیر اختیاری DNS_UDP53_VERIFIED نامعتبر است؛ تا زمان تنظیم صریح برابر true، شنوندهٔ UDP/53 تأییدنشده تلقی می‌شود.'
+    );
+  }
+
+  const anyDnsVarProvided = Boolean(domain || token || udp53Verified);
+
+  if (!anyDnsVarProvided) {
+    return {
+      configured: false,
+      configState: configIssuesFa.length > 0 ? 'partial_or_invalid' : 'unconfigured',
+      missingVars: [],
+      configIssuesFa,
+      dnsLeakDomain: null,
+      messageFa:
+        'وضعیت: پیکربندی نشده — زیرساخت اختیاری Authoritative DNS فعال نیست. تا پیش از راه‌اندازی و تأیید شنوندهٔ واقعی Authoritative DNS روی پورت UDP/53، هیچ نتیجه‌ای به عنوان امن یا موفق اعلام نمی‌شود.',
+    };
+  }
+
   const missingVars: string[] = [];
-  if (!domain || !isValidDnsLeakBaseDomain(domain)) missingVars.push('DNS_LEAK_DOMAIN');
-  if (!hasKv) missingVars.push('DNS_LOGS_KV');
-  if (!token) missingVars.push('DNS_COLLECTOR_API_TOKEN');
-  if (!udp53Verified) missingVars.push('DNS_UDP53_VERIFIED=true');
+  if (!domain) {
+    missingVars.push('DNS_LEAK_DOMAIN');
+    configIssuesFa.push('متغیر DNS_LEAK_DOMAIN خالی است.');
+  } else if (!isValidDnsLeakBaseDomain(domain)) {
+    missingVars.push('DNS_LEAK_DOMAIN');
+    configIssuesFa.push('قالب دامنهٔ DNS_LEAK_DOMAIN نامعتبر است.');
+  }
+
+  if (!hasKv) {
+    missingVars.push('DNS_LOGS_KV');
+    configIssuesFa.push('اتصال فضای ذخیره‌سازی DNS_LOGS_KV تنظیم نشده است.');
+  }
+  if (!token) {
+    missingVars.push('DNS_COLLECTOR_API_TOKEN');
+    configIssuesFa.push('توکن احراز هویت DNS_COLLECTOR_API_TOKEN خالی است.');
+  }
+  if (!udp53Verified) {
+    missingVars.push('DNS_UDP53_VERIFIED=true');
+    configIssuesFa.push('تأیید عملی شنوندهٔ UDP/53 (DNS_UDP53_VERIFIED=true) فعال نشده است.');
+  }
+
+  if (missingVars.length > 0) {
+    return {
+      configured: false,
+      configState: 'partial_or_invalid',
+      missingVars,
+      configIssuesFa,
+      dnsLeakDomain: null,
+      messageFa: `وضعیت: پیکربندی نشده (تنظیمات اختیاری ناقص یا نامعتبر) — ${configIssuesFa.join(' ')} تا پیش از تکمیل و تأیید شنوندهٔ UDP/53، هیچ نتیجه‌ای به عنوان امن یا موفق اعلام نمی‌شود.`,
+    };
+  }
 
   return {
-    configured: missingVars.length === 0,
-    missingVars,
-    dnsLeakDomain: domain && isValidDnsLeakBaseDomain(domain) ? domain : null,
+    configured: true,
+    configState: 'configured',
+    missingVars: [],
+    configIssuesFa,
+    dnsLeakDomain: domain,
+    messageFa: 'زیرساخت Authoritative DNS پیکربندی شده است.',
   };
 }
 
@@ -450,7 +505,9 @@ export default {
           timestamp: new Date().toISOString(),
           optionalIntegrations: {
             authoritativeDnsConfigured: dnsStatus.configured,
+            dnsConfigState: dnsStatus.configState,
             missingDnsEnvVars: dnsStatus.missingVars,
+            dnsConfigIssuesFa: dnsStatus.configIssuesFa,
             tokenRotationEnabled: Boolean((env.DNS_COLLECTOR_API_TOKEN_PREVIOUS || '').trim()),
             abuseIpDbConfigured: Boolean((env.ABUSEIPDB_API_KEY || '').trim()),
             googleSafeBrowsingConfigured: false,
@@ -880,11 +937,12 @@ export default {
             startedAt,
             completedAt: new Date().toISOString(),
             authoritativeConfigured: false,
+            configState: dnsConfig.configState,
             missingEnvVars: dnsConfig.missingVars,
+            configIssuesFa: dnsConfig.configIssuesFa,
             dnsLeakDomain: null,
             resolvers: [],
-            messageFa:
-              `وضعیت: پیکربندی نشده — متغیرهای زیرساختی (${dnsConfig.missingVars.join('، ')}) تنظیم یا تأیید نشده‌اند. تا پیش از راه‌اندازی و تأیید شنوندهٔ واقعی Authoritative DNS روی پورت UDP/53، هیچ نتیجه‌ای به عنوان امن یا موفق اعلام نمی‌شود.`,
+            messageFa: dnsConfig.messageFa,
           },
           { headers: securityAndCorsHeaders }
         );
