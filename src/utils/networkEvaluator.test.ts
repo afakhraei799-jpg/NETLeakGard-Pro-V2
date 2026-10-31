@@ -37,7 +37,14 @@ import {
 } from '../components/Globe3D';
 import cloudflareWorker, { type Env as CloudflareEnv } from '../../cloudflare/worker';
 // @ts-ignore
-import { extractRunIdFromQname, parseDnsLeakQname, evaluateDnsQueryPacket, isUdp53ResponderConfigured } from '../../cloudflare/authoritative-dns-udp53.mjs';
+import {
+  isValidBaseDomain,
+  encodeDnsWireName,
+  extractRunIdFromQname,
+  parseDnsLeakQname,
+  evaluateDnsQueryPacket,
+  isUdp53ResponderConfigured,
+} from '../../cloudflare/authoritative-dns-udp53.mjs';
 
 test('IP validation and RFC1918/mDNS private address classification', () => {
   assert.equal(isValidIpv4('1.1.1.1'), true);
@@ -2155,7 +2162,7 @@ test('Authoritative UDP/53 DNS packet responder enforces RFC 1035 QR=1 ignore, F
     return Buffer.concat([header, ...labelBuffers, tail]);
   }
 
-  // 1. Valid A query (QTYPE=1) for p1.<runId>.leak.example.com -> NOERROR (RCODE=0, AA=1, ANCOUNT=1) + observation extracted
+  // 1. Valid A query (QTYPE=1) for p1.<runId>.leak.example.com -> NOERROR (RCODE=0, AA=1, ANCOUNT=1, NSCOUNT=0) + observation extracted
   const validAQuery = encodeDnsQueryPacket({
     txId: 0x4321,
     qname: `p1.${validRunId}.${allowedDomain}`,
@@ -2170,11 +2177,12 @@ test('Authoritative UDP/53 DNS packet responder enforces RFC 1035 QR=1 ignore, F
   assert.equal((resA.responseBuffer.readUInt16BE(2) & 0x0400) !== 0, true); // AA=1
   assert.equal(resA.responseBuffer.readUInt16BE(2) & 0x000f, 0); // RCODE=0 (NOERROR)
   assert.equal(resA.responseBuffer.readUInt16BE(6), 1); // ANCOUNT=1 (0.0.0.0 A record)
+  assert.equal(resA.responseBuffer.readUInt16BE(8), 0); // NSCOUNT=0
   assert.ok(resA.observation);
   assert.equal(resA.observation.runId, validRunId);
   assert.equal(resA.observation.probeNumber, 1);
 
-  // 2. Valid AAAA query (QTYPE=28) for p2.<runId>.leak.example.com -> NOERROR NODATA (RCODE=0, AA=1, ANCOUNT=0) + observation extracted
+  // 2. Valid AAAA query (QTYPE=28) for p2.<runId>.leak.example.com -> NOERROR NODATA (RCODE=0, AA=1, ANCOUNT=0, NSCOUNT=1 SOA Authority) + observation extracted
   const validAAAAQuery = encodeDnsQueryPacket({
     qname: `p2.${validRunId}.${allowedDomain}`,
     qtype: 28,
@@ -2182,12 +2190,78 @@ test('Authoritative UDP/53 DNS packet responder enforces RFC 1035 QR=1 ignore, F
   const resAAAA = evaluateDnsQueryPacket(validAAAAQuery, allowedDomain);
   assert.equal(resAAAA.ignore, false);
   assert.equal(resAAAA.rcode, 0);
+  assert.equal((resAAAA.responseBuffer.readUInt16BE(2) & 0x0400) !== 0, true); // AA=1
   assert.equal(resAAAA.responseBuffer.readUInt16BE(6), 0); // ANCOUNT=0 (NODATA)
+  assert.equal(resAAAA.responseBuffer.readUInt16BE(8), 1); // NSCOUNT=1 (SOA in Authority per RFC 2308)
   assert.ok(resAAAA.observation);
   assert.equal(resAAAA.observation.runId, validRunId);
   assert.equal(resAAAA.observation.probeNumber, 2);
 
-  // 3. Incoming packet with QR=1 (already a response) -> ignored to prevent UDP reflection loops
+  // 3. Zone Apex NS query (QTYPE=2) on leak.example.com -> NOERROR (RCODE=0, AA=1, ANCOUNT=1 NS record, NSCOUNT=0) and NO probe observation
+  const apexNsQuery = encodeDnsQueryPacket({
+    txId: 0x2222,
+    qname: allowedDomain,
+    qtype: 2, // NS
+  });
+  const resApexNs = evaluateDnsQueryPacket(apexNsQuery, allowedDomain);
+  assert.equal(resApexNs.ignore, false);
+  assert.equal(resApexNs.rcode, 0);
+  assert.equal((resApexNs.responseBuffer.readUInt16BE(2) & 0x0400) !== 0, true); // AA=1
+  assert.equal(resApexNs.responseBuffer.readUInt16BE(6), 1); // ANCOUNT=1 (NS RR)
+  assert.equal(resApexNs.responseBuffer.readUInt16BE(8), 0); // NSCOUNT=0
+  assert.equal(resApexNs.observation, null);
+  const expectedNsWire = encodeDnsWireName(`ns1.${allowedDomain}`);
+  assert.equal(resApexNs.responseBuffer.includes(expectedNsWire), true);
+
+  // 4. Zone Apex SOA query (QTYPE=6) on leak.example.com -> NOERROR (RCODE=0, AA=1, ANCOUNT=1 SOA record, NSCOUNT=0) and NO probe observation
+  const apexSoaQuery = encodeDnsQueryPacket({
+    txId: 0x6666,
+    qname: allowedDomain,
+    qtype: 6, // SOA
+  });
+  const resApexSoa = evaluateDnsQueryPacket(apexSoaQuery, allowedDomain);
+  assert.equal(resApexSoa.ignore, false);
+  assert.equal(resApexSoa.rcode, 0);
+  assert.equal((resApexSoa.responseBuffer.readUInt16BE(2) & 0x0400) !== 0, true); // AA=1
+  assert.equal(resApexSoa.responseBuffer.readUInt16BE(6), 1); // ANCOUNT=1 (SOA RR)
+  assert.equal(resApexSoa.responseBuffer.readUInt16BE(8), 0); // NSCOUNT=0
+  assert.equal(resApexSoa.observation, null);
+  const expectedHostmasterWire = encodeDnsWireName(`hostmaster.${allowedDomain}`);
+  assert.equal(resApexSoa.responseBuffer.includes(expectedNsWire), true);
+  assert.equal(resApexSoa.responseBuffer.includes(expectedHostmasterWire), true);
+
+  // 5. Zone Apex A (QTYPE=1) and AAAA (QTYPE=28) queries -> NOERROR NODATA (ANCOUNT=0, NSCOUNT=1 SOA in Authority) and NO probe observation
+  for (const apexQtype of [1, 28]) {
+    const apexAddrQuery = encodeDnsQueryPacket({
+      qname: allowedDomain,
+      qtype: apexQtype,
+    });
+    const resApexAddr = evaluateDnsQueryPacket(apexAddrQuery, allowedDomain);
+    assert.equal(resApexAddr.ignore, false);
+    assert.equal(resApexAddr.rcode, 0); // NOERROR (domain exists, NODATA)
+    assert.equal((resApexAddr.responseBuffer.readUInt16BE(2) & 0x0400) !== 0, true); // AA=1
+    assert.equal(resApexAddr.responseBuffer.readUInt16BE(6), 0); // ANCOUNT=0
+    assert.equal(resApexAddr.responseBuffer.readUInt16BE(8), 1); // NSCOUNT=1 (SOA in Authority)
+    assert.equal(resApexAddr.observation, null);
+  }
+
+  // 6. Probe subdomain NS (QTYPE=2) and SOA (QTYPE=6) queries -> NOERROR NODATA (ANCOUNT=0, NSCOUNT=1 SOA in Authority) + observation recorded
+  for (const probeQtype of [2, 6]) {
+    const probeMetaQuery = encodeDnsQueryPacket({
+      qname: `p3.${validRunId}.${allowedDomain}`,
+      qtype: probeQtype,
+    });
+    const resProbeMeta = evaluateDnsQueryPacket(probeMetaQuery, allowedDomain);
+    assert.equal(resProbeMeta.ignore, false);
+    assert.equal(resProbeMeta.rcode, 0);
+    assert.equal(resProbeMeta.responseBuffer.readUInt16BE(6), 0); // ANCOUNT=0
+    assert.equal(resProbeMeta.responseBuffer.readUInt16BE(8), 1); // NSCOUNT=1 (SOA in Authority)
+    assert.ok(resProbeMeta.observation);
+    assert.equal(resProbeMeta.observation.runId, validRunId);
+    assert.equal(resProbeMeta.observation.probeNumber, 3);
+  }
+
+  // 7. Incoming packet with QR=1 (already a response) -> ignored to prevent UDP reflection loops
   const qr1Packet = encodeDnsQueryPacket({
     flags: 0x8180, // QR=1
     qname: `p1.${validRunId}.${allowedDomain}`,
@@ -2198,7 +2272,7 @@ test('Authoritative UDP/53 DNS packet responder enforces RFC 1035 QR=1 ignore, F
   assert.equal(resQr1.responseBuffer, null);
   assert.equal(resQr1.observation, null);
 
-  // 4. Out-of-domain query (e.g. google.com) -> REFUSED (RCODE=5, AA=0) and NO observation recorded
+  // 8. Out-of-domain query (e.g. google.com) -> REFUSED (RCODE=5, AA=0) and NO observation recorded
   const outOfZoneQuery = encodeDnsQueryPacket({
     qname: 'www.example.org',
     qtype: 1,
@@ -2209,7 +2283,7 @@ test('Authoritative UDP/53 DNS packet responder enforces RFC 1035 QR=1 ignore, F
   assert.equal((resRefused.responseBuffer.readUInt16BE(2) & 0x0400) !== 0, false); // AA=0
   assert.equal(resRefused.observation, null);
 
-  // 5. In-domain query that does NOT match p<N>.<runId>.<domain> -> NXDOMAIN (RCODE=3, AA=1) and NO observation recorded
+  // 9. In-domain query that does NOT match p<N>.<runId>.<domain> -> NXDOMAIN (RCODE=3, AA=1, NSCOUNT=1 SOA Authority) and NO observation recorded
   const invalidSubdomainQuery = encodeDnsQueryPacket({
     qname: `unknown-host.${allowedDomain}`,
     qtype: 1,
@@ -2218,9 +2292,11 @@ test('Authoritative UDP/53 DNS packet responder enforces RFC 1035 QR=1 ignore, F
   assert.equal(resNx.ignore, false);
   assert.equal(resNx.rcode, 3); // NXDOMAIN
   assert.equal((resNx.responseBuffer.readUInt16BE(2) & 0x0400) !== 0, true); // AA=1
+  assert.equal(resNx.responseBuffer.readUInt16BE(6), 0); // ANCOUNT=0
+  assert.equal(resNx.responseBuffer.readUInt16BE(8), 1); // NSCOUNT=1 (SOA in Authority)
   assert.equal(resNx.observation, null);
 
-  // 6. Unsupported QTYPE (e.g. AXFR=252) or QCLASS (e.g. CH=3) -> NOTIMP (RCODE=4) and NO observation recorded
+  // 10. Unsupported QTYPE (e.g. AXFR=252) or QCLASS (e.g. CH=3) -> NOTIMP (RCODE=4) and NO observation recorded
   const axfrQuery = encodeDnsQueryPacket({
     qname: `p1.${validRunId}.${allowedDomain}`,
     qtype: 252,
@@ -2230,7 +2306,7 @@ test('Authoritative UDP/53 DNS packet responder enforces RFC 1035 QR=1 ignore, F
   assert.equal(resNotImp.rcode, 4); // NOTIMP
   assert.equal(resNotImp.observation, null);
 
-  // 7. Malformed DNS query packet (truncated question) -> FORMERR (RCODE=1)
+  // 11. Malformed DNS query packet (truncated question) -> FORMERR (RCODE=1)
   const malformedBuf = Buffer.alloc(14);
   malformedBuf.writeUInt16BE(0x9999, 0);
   malformedBuf.writeUInt16BE(0x0100, 2);
@@ -2240,6 +2316,46 @@ test('Authoritative UDP/53 DNS packet responder enforces RFC 1035 QR=1 ignore, F
   assert.equal(resFormErr.ignore, false);
   assert.equal(resFormErr.rcode, 1); // FORMERR
   assert.equal(resFormErr.observation, null);
+});
+
+test('isValidBaseDomain and isUdp53ResponderConfigured strictly validate domains in authoritative-dns-udp53.mjs', () => {
+  // Valid base domains
+  assert.equal(isValidBaseDomain('leak.example.com'), true);
+  assert.equal(isValidBaseDomain('dns-test.netleakguard.ir'), true);
+  assert.equal(isValidBaseDomain('.sub.domain.co.uk.'), true);
+
+  // Invalid base domains
+  assert.equal(isValidBaseDomain(''), false);
+  assert.equal(isValidBaseDomain('   '), false);
+  assert.equal(isValidBaseDomain('localhost'), false);
+  assert.equal(isValidBaseDomain('myhost.local'), false);
+  assert.equal(isValidBaseDomain('127.0.0.1'), false);
+  assert.equal(isValidBaseDomain('singlelabel'), false);
+  assert.equal(isValidBaseDomain('bad..domain.com'), false);
+  assert.equal(isValidBaseDomain('-badlabel.example.com'), false);
+  assert.equal(isValidBaseDomain('badlabel-.example.com'), false);
+  assert.equal(isValidBaseDomain('domain.123'), false);
+  assert.equal(isValidBaseDomain('a.'.repeat(100) + 'com'), false); // > 185 chars
+  assert.equal(isValidBaseDomain(null as any), false);
+  assert.equal(isValidBaseDomain(undefined as any), false);
+
+  // isUdp53ResponderConfigured with valid non-empty configuration
+  const validConfig = isUdp53ResponderConfigured({
+    DNS_LEAK_DOMAIN: 'Leak.Example.com.',
+    WORKER_INGEST_URL: 'https://worker.example.com/api/dns-collector/ingest',
+    DNS_COLLECTOR_API_TOKEN: 'valid-secret-token',
+  });
+  assert.equal(validConfig.configured, true);
+  assert.equal(validConfig.domain, 'leak.example.com');
+
+  // isUdp53ResponderConfigured with invalid domain must return configured=false without throwing
+  const invalidDomainConfig = isUdp53ResponderConfigured({
+    DNS_LEAK_DOMAIN: 'invalid..domain',
+    WORKER_INGEST_URL: 'https://worker.example.com/api/dns-collector/ingest',
+    DNS_COLLECTOR_API_TOKEN: 'valid-secret-token',
+  });
+  assert.equal(invalidDomainConfig.configured, false);
+  assert.equal(invalidDomainConfig.domain, null);
 });
 
 test('Zero-config execution: application runs with all environment variables empty without demanding variables, keeps Authoritative DNS as NOT_CONFIGURED, and executes independent tests', async () => {

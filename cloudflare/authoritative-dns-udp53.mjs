@@ -43,6 +43,74 @@ const VALID_RUN_ID_REGEX = /^[a-z0-9](?:[a-z0-9-]{6,61}[a-z0-9])$/i;
 const PREFIXED_UUID_TRAP_REGEX = /^p[0-9]+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
+ * اعتبارسنجی دامنهٔ پایهٔ تست DNS طبق محدودیت‌های RFC 1035
+ * (رد مقادیر خالی، localhost، دامنهٔ تک‌بخشی، TLD عددی یا طول نامعتبر)
+ */
+export function isValidBaseDomain(rawDomain) {
+  if (typeof rawDomain !== 'string') return false;
+  const trimmed = rawDomain.trim().toLowerCase().replace(/^\.+|\.+$/g, '');
+  if (!trimmed || trimmed.length < 3 || trimmed.length > 185) return false;
+  if (trimmed === 'localhost' || trimmed.endsWith('.local') || trimmed.includes('..')) return false;
+  const labels = trimmed.split('.');
+  if (labels.length < 2) return false;
+  const tld = labels[labels.length - 1];
+  if (tld.length < 2 || /^\d+$/.test(tld)) return false;
+  return labels.every(l => l.length >= 1 && l.length <= 63 && DNS_SINGLE_LABEL_REGEX.test(l));
+}
+
+/**
+ * تبدیل نام دامنهٔ متنی (FQDN) به قالب باینری برچسب‌های RFC 1035 (`<len><label>...<0x00>`)
+ */
+export function encodeDnsWireName(fqdn) {
+  const clean = String(fqdn || '').trim().toLowerCase().replace(/^\.+|\.+$/g, '');
+  if (!clean) return Buffer.from([0x00]);
+  const parts = [];
+  for (const label of clean.split('.')) {
+    const ascii = Buffer.from(label, 'ascii');
+    parts.push(Buffer.from([ascii.length]), ascii);
+  }
+  parts.push(Buffer.from([0x00]));
+  return Buffer.concat(parts);
+}
+
+/**
+ * ساخت رکورد SOA باینری طبق RFC 1035 / RFC 2308 برای بخش Answer یا Authority
+ */
+function buildSoaResourceRecord(ownerNameBuf, zoneDomain, ttlSeconds = 60) {
+  const mnameBuf = encodeDnsWireName(`ns1.${zoneDomain}`);
+  const rnameBuf = encodeDnsWireName(`hostmaster.${zoneDomain}`);
+  const timersBuf = Buffer.alloc(20);
+  timersBuf.writeUInt32BE(2026030101, 0); // SERIAL
+  timersBuf.writeUInt32BE(3600, 4);       // REFRESH (1h)
+  timersBuf.writeUInt32BE(600, 8);        // RETRY (10m)
+  timersBuf.writeUInt32BE(86400, 12);     // EXPIRE (24h)
+  timersBuf.writeUInt32BE(10, 16);        // MINIMUM / Negative Caching TTL (10s)
+
+  const rdata = Buffer.concat([mnameBuf, rnameBuf, timersBuf]);
+  const rrHeader = Buffer.alloc(10);
+  rrHeader.writeUInt16BE(6, 0);           // TYPE = SOA (6)
+  rrHeader.writeUInt16BE(1, 2);           // CLASS = IN (1)
+  rrHeader.writeUInt32BE(ttlSeconds, 4);  // TTL
+  rrHeader.writeUInt16BE(rdata.length, 8);// RDLENGTH
+
+  return Buffer.concat([ownerNameBuf, rrHeader, rdata]);
+}
+
+/**
+ * ساخت رکورد NS باینری طبق RFC 1035 برای بخش Answer
+ */
+function buildNsResourceRecord(ownerNameBuf, zoneDomain, ttlSeconds = 300) {
+  const rdata = encodeDnsWireName(`ns1.${zoneDomain}`);
+  const rrHeader = Buffer.alloc(10);
+  rrHeader.writeUInt16BE(2, 0);           // TYPE = NS (2)
+  rrHeader.writeUInt16BE(1, 2);           // CLASS = IN (1)
+  rrHeader.writeUInt32BE(ttlSeconds, 4);  // TTL
+  rrHeader.writeUInt16BE(rdata.length, 8);// RDLENGTH
+
+  return Buffer.concat([ownerNameBuf, rrHeader, rdata]);
+}
+
+/**
  * استخراج نام دامنهٔ استعلام‌شده (QNAME) از بستهٔ باینری DNS طبق RFC 1035
  */
 export function parseDnsQname(msg) {
@@ -88,11 +156,23 @@ export function parseDnsQname(msg) {
 }
 
 /**
- * ساخت بستهٔ پاسخ DNS طبق RFC 1035 با کد وضعیت (RCODE) و بیت Authoritative (AA) مشخص
- * - RCODE=0 (NOERROR): برای QTYPE=1 (A) رکورد A=0.0.0.0 با TTL=10s برمی‌گرداند و برای سایر انواع مجاز (مانند AAAA) پاسخ NODATA (ANCOUNT=0) می‌دهد.
- * - RCODE=1 (FORMERR)، RCODE=3 (NXDOMAIN)، RCODE=4 (NOTIMP)، RCODE=5 (REFUSED)
+ * ساخت بستهٔ پاسخ حداقلی Authoritative DNS طبق RFC 1035 / RFC 2308
+ * (این پیاده‌سازی صرفاً یک شنوندهٔ سبک برای تشخیص نشت DNS است و سرور DNS عمومی کامل محسوب نمی‌شود):
+ * - برای پروب معتبر و QTYPE=1 (A): پاسخ NOERROR با رکورد A=0.0.0.0 (TTL=10s) در بخش Answer
+ * - برای دامنهٔ پایه (Apex) و QTYPE=2 (NS): پاسخ NOERROR با رکورد NS (`ns1.<zone>`) در بخش Answer
+ * - برای دامنهٔ پایه (Apex) و QTYPE=6 (SOA): پاسخ NOERROR با رکورد SOA در بخش Answer
+ * - برای پاسخ‌های NODATA (مانند AAAA روی پروب معتبر یا A/AAAA روی Apex) و NXDOMAIN (RCODE=3):
+ *   قرار دادن رکورد SOA دامنهٔ پایه در بخش Authority (NSCOUNT=1) طبق RFC 2308
  */
-export function buildMinimalDnsResponse(queryBuf, questionEndOffset, qtype, rcode = 0, authoritative = true) {
+export function buildMinimalDnsResponse(
+  queryBuf,
+  questionEndOffset,
+  qtype,
+  rcode = 0,
+  authoritative = true,
+  options = {}
+) {
+  const { zoneDomain = '', isZoneApex = false } = options || {};
   const txId = queryBuf.readUInt16BE(0);
   const reqFlags = queryBuf.readUInt16BE(2);
   const rdBit = reqFlags & 0x0100;
@@ -106,31 +186,62 @@ export function buildMinimalDnsResponse(queryBuf, questionEndOffset, qtype, rcod
     questionEndOffset > 12 &&
     questionEndOffset <= queryBuf.length;
   const questionSection = hasValidQuestion ? queryBuf.subarray(12, questionEndOffset) : Buffer.alloc(0);
-  const includeARecord = safeRcode === 0 && authoritative && hasValidQuestion && qtype === 1;
+  const validZone = isValidBaseDomain(zoneDomain)
+    ? zoneDomain.trim().toLowerCase().replace(/^\.+|\.+$/g, '')
+    : '';
+  const qnamePointer = Buffer.from([0xc0, 0x0c]);
+
+  let answerSection = Buffer.alloc(0);
+  let authoritySection = Buffer.alloc(0);
+  let anCount = 0;
+  let nsCount = 0;
+
+  if (authoritative && hasValidQuestion) {
+    if (safeRcode === 0) {
+      if (!isZoneApex && qtype === 1) {
+        // پاسخ A رکورد برای پروب معتبر (`p<N>.<runId>.<zone>`) با TTL=10s به 0.0.0.0
+        answerSection = Buffer.from([
+          0xc0, 0x0c, // Pointer to QNAME at offset 12
+          0x00, 0x01, // TYPE A
+          0x00, 0x01, // CLASS IN
+          0x00, 0x00, 0x00, 0x0a, // TTL = 10s
+          0x00, 0x04, // RDLENGTH = 4
+          0x00, 0x00, 0x00, 0x00  // RDATA = 0.0.0.0
+        ]);
+        anCount = 1;
+      } else if (isZoneApex && qtype === 2 && validZone) {
+        // پاسخ NS رکورد روی دامنهٔ پایه (Apex)
+        answerSection = buildNsResourceRecord(qnamePointer, validZone, 300);
+        anCount = 1;
+      } else if (isZoneApex && qtype === 6 && validZone) {
+        // پاسخ SOA رکورد روی دامنهٔ پایه (Apex)
+        answerSection = buildSoaResourceRecord(qnamePointer, validZone, 60);
+        anCount = 1;
+      } else if (validZone) {
+        // پاسخ NODATA (مانند AAAA روی پروب یا A/AAAA روی Apex) به همراه SOA در بخش Authority طبق RFC 2308
+        authoritySection = buildSoaResourceRecord(encodeDnsWireName(validZone), validZone, 10);
+        nsCount = 1;
+      }
+    } else if (safeRcode === 3 && validZone) {
+      // پاسخ NXDOMAIN به همراه رکورد SOA در بخش Authority طبق RFC 1035 / RFC 2308
+      authoritySection = buildSoaResourceRecord(encodeDnsWireName(validZone), validZone, 10);
+      nsCount = 1;
+    }
+  }
 
   const header = Buffer.alloc(12);
   header.writeUInt16BE(txId, 0);
   header.writeUInt16BE(respFlags, 2);
   header.writeUInt16BE(hasValidQuestion ? 1 : 0, 4); // QDCOUNT
-  header.writeUInt16BE(includeARecord ? 1 : 0, 6); // ANCOUNT
-  header.writeUInt16BE(0, 8); // NSCOUNT
-  header.writeUInt16BE(0, 10); // ARCOUNT
+  header.writeUInt16BE(anCount, 6);                  // ANCOUNT
+  header.writeUInt16BE(nsCount, 8);                  // NSCOUNT
+  header.writeUInt16BE(0, 10);                       // ARCOUNT
 
-  if (!includeARecord) {
-    return hasValidQuestion ? Buffer.concat([header, questionSection]) : header;
+  if (!hasValidQuestion) {
+    return header;
   }
 
-  // پاسخ A رکورد با TTL=10 ثانیه به 0.0.0.0 صرفاً جهت بسته شدن سریع کوئری DNS
-  const answer = Buffer.from([
-    0xc0, 0x0c, // Pointer to QNAME at offset 12
-    0x00, 0x01, // TYPE A
-    0x00, 0x01, // CLASS IN
-    0x00, 0x00, 0x00, 0x0a, // TTL = 10s
-    0x00, 0x04, // RDLENGTH = 4
-    0x00, 0x00, 0x00, 0x00  // RDATA = 0.0.0.0
-  ]);
-
-  return Buffer.concat([header, questionSection, answer]);
+  return Buffer.concat([header, questionSection, answerSection, authoritySection]);
 }
 
 const SUPPORTED_DNS_QTYPES = new Set([
@@ -182,8 +293,9 @@ export function evaluateDnsQueryPacket(msg, allowedDomain = DNS_LEAK_DOMAIN) {
   const normDomain = typeof allowedDomain === 'string'
     ? allowedDomain.trim().toLowerCase().replace(/^\.+|\.+$/g, '')
     : '';
+  const hasValidZone = isValidBaseDomain(normDomain);
   const isInAllowedZone =
-    normDomain.length > 0 &&
+    hasValidZone &&
     (parsed.qname === normDomain || parsed.qname.endsWith(`.${normDomain}`));
 
   // ۴. پرس‌وجوهای خارج از دامنهٔ مجاز تست -> REFUSED (RCODE=5, AA=0)
@@ -201,37 +313,49 @@ export function evaluateDnsQueryPacket(msg, allowedDomain = DNS_LEAK_DOMAIN) {
     return {
       ignore: false,
       rcode: 4, // NOTIMP
-      responseBuffer: buildMinimalDnsResponse(msg, parsed.questionEndOffset, parsed.qtype, 4, true),
+      responseBuffer: buildMinimalDnsResponse(msg, parsed.questionEndOffset, parsed.qtype, 4, true, {
+        zoneDomain: normDomain,
+      }),
       observation: null,
     };
   }
 
-  // ۶. بررسی تطابق نام پرس‌وجو با قالب استاندارد `p<N>.<runId>.<allowedDomain>`
+  // ۶. اگر خود دامنهٔ پایه (Zone Apex) استعلام شده باشد (NS/SOA با رکورد پاسخ و A/AAAA با NODATA + SOA Authority)
+  if (parsed.qname === normDomain) {
+    return {
+      ignore: false,
+      rcode: 0, // NOERROR
+      responseBuffer: buildMinimalDnsResponse(msg, parsed.questionEndOffset, parsed.qtype, 0, true, {
+        zoneDomain: normDomain,
+        isZoneApex: true,
+      }),
+      observation: null,
+    };
+  }
+
+  // ۷. بررسی تطابق نام پرس‌وجو با قالب استاندارد `p<N>.<runId>.<allowedDomain>`
   const validatedQname = parseDnsLeakQname(parsed.qname, normDomain);
   if (!validatedQname) {
-    // اگر خود دامنهٔ پایه برای NS/SOA استعلام شده باشد، پاسخ خالی NOERROR (NODATA) بدون ثبت شاهد برگردانده می‌شود
-    if (parsed.qname === normDomain && (parsed.qtype === 2 || parsed.qtype === 6)) {
-      return {
-        ignore: false,
-        rcode: 0,
-        responseBuffer: buildMinimalDnsResponse(msg, parsed.questionEndOffset, parsed.qtype, 0, true),
-        observation: null,
-      };
-    }
-    // سایر زیردامنه‌های نامعتبر در داخل دامنهٔ تست -> NXDOMAIN (RCODE=3, AA=1)
+    // سایر زیردامنه‌های نامعتبر در داخل دامنهٔ تست -> NXDOMAIN (RCODE=3, AA=1, NSCOUNT=1 SOA)
     return {
       ignore: false,
       rcode: 3, // NXDOMAIN
-      responseBuffer: buildMinimalDnsResponse(msg, parsed.questionEndOffset, parsed.qtype, 3, true),
+      responseBuffer: buildMinimalDnsResponse(msg, parsed.questionEndOffset, parsed.qtype, 3, true, {
+        zoneDomain: normDomain,
+        isZoneApex: false,
+      }),
       observation: null,
     };
   }
 
-  // ۷. پرس‌وجوی معتبر برای `p<N>.<runId>.<allowedDomain>` -> NOERROR (RCODE=0, AA=1) و ثبت شاهد
+  // ۸. پرس‌وجوی معتبر برای `p<N>.<runId>.<allowedDomain>` -> NOERROR (RCODE=0, AA=1) و ثبت شاهد
   return {
     ignore: false,
     rcode: 0, // NOERROR
-    responseBuffer: buildMinimalDnsResponse(msg, parsed.questionEndOffset, parsed.qtype, 0, true),
+    responseBuffer: buildMinimalDnsResponse(msg, parsed.questionEndOffset, parsed.qtype, 0, true, {
+      zoneDomain: normDomain,
+      isZoneApex: false,
+    }),
     observation: validatedQname,
   };
 }
@@ -245,14 +369,7 @@ export function evaluateDnsQueryPacket(msg, allowedDomain = DNS_LEAK_DOMAIN) {
 export function parseDnsLeakQname(rawQname, allowedDomain = DNS_LEAK_DOMAIN) {
   if (typeof rawQname !== 'string' || typeof allowedDomain !== 'string') return null;
   const normDomain = allowedDomain.trim().toLowerCase().replace(/^\.+|\.+$/g, '');
-  if (normDomain.length < 3 || normDomain.length > 185 || normDomain.includes('..')) return null;
-  const domainLabels = normDomain.split('.');
-  if (
-    domainLabels.length < 2 ||
-    !domainLabels.every(l => l.length >= 1 && l.length <= 63 && DNS_SINGLE_LABEL_REGEX.test(l)) ||
-    domainLabels[domainLabels.length - 1].length < 2 ||
-    /^\d+$/.test(domainLabels[domainLabels.length - 1])
-  ) {
+  if (!isValidBaseDomain(normDomain)) {
     return null;
   }
 
